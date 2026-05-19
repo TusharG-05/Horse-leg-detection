@@ -1,0 +1,1054 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Horse Leg Symmetry Analyzer - Premium Dashboard</title>
+
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap"
+        rel="stylesheet">
+
+    <!-- Icons (Lucide via CDN) -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+
+    <style>
+        :root {
+            --bg-base: #07050f;
+            --bg-surface: rgba(18, 14, 38, 0.4);
+            --border-glow: rgba(139, 92, 246, 0.2);
+            --border-base: rgba(255, 255, 255, 0.07);
+            --text-primary: #f3f4f6;
+            --text-secondary: #9ca3af;
+            --primary: #8b5cf6;
+            --primary-glow: rgba(139, 92, 246, 0.5);
+            --secondary: #06b6d4;
+            --accent-green: #10b981;
+            --accent-red: #ef4444;
+            --accent-blue: #3b82f6;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background-color: var(--bg-base);
+            color: var(--text-primary);
+            font-family: 'Inter', sans-serif;
+            overflow-x: hidden;
+            min-height: 100vh;
+            background-image:
+                radial-gradient(circle at 10% 20%, rgba(139, 92, 246, 0.15) 0%, transparent 40%),
+                radial-gradient(circle at 90% 80%, rgba(6, 182, 212, 0.12) 0%, transparent 40%),
+                radial-gradient(circle at 50% 50%, rgba(7, 5, 15, 1) 0%, rgba(7, 5, 15, 1) 100%);
+            background-attachment: fixed;
+        }
+
+        /* Header Styles */
+        header {
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            background: rgba(7, 5, 15, 0.7);
+            border-bottom: 1px solid var(--border-base);
+            padding: 1.25rem 2.5rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .logo-container {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .logo-icon {
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            width: 2.75rem;
+            height: 2.75rem;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            box-shadow: 0 0 15px rgba(139, 92, 246, 0.4);
+        }
+
+        .logo-title {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.5rem;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            background: linear-gradient(to right, #ffffff, #a78bfa);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .stats-badge {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--border-base);
+            padding: 0.5rem 1rem;
+            border-radius: 9999px;
+            font-size: 0.875rem;
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            color: var(--text-secondary);
+        }
+
+        .stats-count {
+            color: #fff;
+            font-weight: 700;
+            background: var(--primary);
+            padding: 0.15rem 0.5rem;
+            border-radius: 10px;
+            font-size: 0.75rem;
+        }
+
+        /* Main Container */
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 2.5rem;
+        }
+
+        /* Search & Filter Bar */
+        .toolbar {
+            display: flex;
+            gap: 1.5rem;
+            margin-bottom: 2.5rem;
+            flex-wrap: wrap;
+        }
+
+        .search-wrapper {
+            position: relative;
+            flex: 1;
+            min-width: 300px;
+        }
+
+        .search-input {
+            width: 100%;
+            background: var(--bg-surface);
+            border: 1px solid var(--border-base);
+            border-radius: 14px;
+            padding: 0.875rem 1rem 0.875rem 2.75rem;
+            color: white;
+            font-size: 0.95rem;
+            font-family: inherit;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            backdrop-filter: blur(10px);
+        }
+
+        .search-input:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 15px rgba(139, 92, 246, 0.15);
+            background: rgba(18, 14, 38, 0.6);
+        }
+
+        .search-icon {
+            position: absolute;
+            left: 1rem;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--text-secondary);
+            pointer-events: none;
+        }
+
+        /* Grid Layout */
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+            gap: 2rem;
+        }
+
+        /* Premium Card */
+        .card {
+            background: var(--bg-surface);
+            border: 1px solid var(--border-base);
+            border-radius: 20px;
+            overflow: hidden;
+            transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+            backdrop-filter: blur(10px);
+            display: flex;
+            flex-direction: column;
+            cursor: pointer;
+            position: relative;
+        }
+
+        .card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            border-radius: 20px;
+            border: 1px solid transparent;
+            background: linear-gradient(135deg, rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0.01)) border-box;
+            -webkit-mask: linear-gradient(#fff 0 0) padding-box, linear-gradient(#fff 0 0);
+            -webkit-mask-composite: xor;
+            mask-composite: exclude;
+            pointer-events: none;
+        }
+
+        .card:hover {
+            transform: translateY(-5px);
+            border-color: rgba(139, 92, 246, 0.3);
+            box-shadow: 0 15px 30px rgba(139, 92, 246, 0.15), 0 0 1px rgba(139, 92, 246, 0.2);
+        }
+
+        .card-image-wrapper {
+            position: relative;
+            width: 100%;
+            padding-top: 100%;
+            /* 1:1 Aspect Ratio */
+            background: #000;
+            overflow: hidden;
+        }
+
+        .card-img {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            transition: transform 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        .card:hover .card-img {
+            transform: scale(1.05);
+        }
+
+        .card-overlay-badge {
+            position: absolute;
+            top: 1rem;
+            right: 1rem;
+            background: rgba(7, 5, 15, 0.8);
+            backdrop-filter: blur(8px);
+            border: 1px solid var(--border-base);
+            padding: 0.35rem 0.75rem;
+            border-radius: 9999px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: #fff;
+            display: flex;
+            align-items: center;
+            gap: 0.35rem;
+        }
+
+        .badge-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background-color: var(--accent-green);
+            box-shadow: 0 0 8px var(--accent-green);
+        }
+
+        .badge-dot.warn {
+            background-color: var(--accent-red);
+            box-shadow: 0 0 8px var(--accent-red);
+        }
+
+        .card-content {
+            padding: 1.25rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+            flex-grow: 1;
+        }
+
+        .card-title {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: white;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .card-meta {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+        }
+
+        .card-meta-item {
+            display: flex;
+            align-items: center;
+            gap: 0.25rem;
+        }
+
+        /* Fullscreen Modal */
+        .modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            z-index: 1000;
+            background: rgba(4, 2, 10, 0.95);
+            backdrop-filter: blur(25px);
+            -webkit-backdrop-filter: blur(25px);
+            display: none;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+            padding: 2rem;
+            overflow-y: auto;
+        }
+
+        .modal.active {
+            display: flex;
+            flex-direction: column;
+            opacity: 1;
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1.5rem;
+            width: 100%;
+            max-width: 1500px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        .modal-title-wrapper {
+            display: flex;
+            flex-direction: column;
+            gap: 0.25rem;
+        }
+
+        .modal-title {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.75rem;
+            font-weight: 700;
+            color: white;
+        }
+
+        .modal-subtitle {
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+        }
+
+        .close-btn {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--border-base);
+            width: 3rem;
+            height: 3rem;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .close-btn:hover {
+            background: rgba(239, 68, 68, 0.2);
+            border-color: rgba(239, 68, 68, 0.4);
+            color: var(--accent-red);
+            transform: rotate(90deg);
+        }
+
+        .modal-tabs {
+            display: flex;
+            gap: 0.75rem;
+            margin-bottom: 2rem;
+            background: rgba(255, 255, 255, 0.03);
+            padding: 0.35rem;
+            border-radius: 12px;
+            border: 1px solid var(--border-base);
+            width: fit-content;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        .tab-btn {
+            background: transparent;
+            border: none;
+            color: var(--text-secondary);
+            padding: 0.6rem 1.25rem;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 500;
+            font-size: 0.9rem;
+            font-family: inherit;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            transition: all 0.3s ease;
+        }
+
+        .tab-btn.active {
+            background: var(--primary);
+            color: white;
+            box-shadow: 0 0 10px rgba(139, 92, 246, 0.3);
+        }
+
+        /* Tab Content layouts */
+        .tab-content {
+            display: none;
+            width: 100%;
+            max-width: 1500px;
+            margin: 0 auto;
+            flex-grow: 1;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        /* 4-Panel Grid layout */
+        .panels-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 1.5rem;
+            width: 100%;
+        }
+
+        @media (max-width: 1200px) {
+            .panels-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+
+        @media (max-width: 768px) {
+            .panels-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .panel-card {
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid var(--border-base);
+            border-radius: 16px;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .panel-header {
+            padding: 1rem;
+            background: rgba(255, 255, 255, 0.03);
+            border-bottom: 1px solid var(--border-base);
+            font-family: 'Outfit', sans-serif;
+            font-weight: 600;
+            font-size: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .panel-img-wrapper {
+            width: 100%;
+            padding-top: 120%;
+            /* Vertically aligned horse image */
+            position: relative;
+            background: #000;
+        }
+
+        .panel-img {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+
+        .no-data-panel {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-secondary);
+            padding: 3rem;
+            text-align: center;
+            gap: 1rem;
+            height: 100%;
+        }
+
+        /* Slider Layout */
+        .slider-container {
+            width: 100%;
+            max-width: 800px;
+            margin: 0 auto;
+            position: relative;
+            border-radius: 20px;
+            overflow: hidden;
+            border: 1px solid var(--border-base);
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+            aspect-ratio: 934/2000;
+            height: 70vh;
+        }
+
+        .slider-img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            position: absolute;
+            top: 0;
+            left: 0;
+            pointer-events: none;
+            user-select: none;
+        }
+
+        .slider-before {
+            z-index: 1;
+        }
+
+        .slider-after {
+            z-index: 2;
+            clip-path: rect(0 50% 100% 0);
+            /* Fallback */
+            width: 100%;
+            height: 100%;
+        }
+
+        .slider-handle-bar {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            width: 4px;
+            background: white;
+            z-index: 3;
+            cursor: ew-resize;
+            box-shadow: 0 0 10px rgba(139, 92, 246, 0.8);
+            left: 50%;
+            transform: translateX(-50%);
+        }
+
+        .slider-button {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 44px;
+            height: 44px;
+            border-radius: 50%;
+            background: var(--primary);
+            border: 3px solid white;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            box-shadow: 0 0 15px rgba(139, 92, 246, 0.8);
+            pointer-events: none;
+        }
+
+        /* Empty State */
+        .empty-state {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 5rem 2rem;
+            color: var(--text-secondary);
+            text-align: center;
+            gap: 1.5rem;
+        }
+
+        .empty-icon {
+            font-size: 4rem;
+            color: var(--primary);
+            opacity: 0.6;
+        }
+    </style>
+</head>
+
+<body>
+
+    <header>
+        <div class="logo-container">
+            <div class="logo-icon">
+                <i data-lucide="activity"></i>
+            </div>
+            <div>
+                <h1 class="logo-title">Leg Symmetry Analyzer</h1>
+            </div>
+        </div>
+        <div class="stats-badge">
+            <i data-lucide="image"></i>
+            Scanned Images <span class="stats-count" id="total-count">0</span>
+        </div>
+    </header>
+
+    <div class="container">
+        <!-- Toolbar -->
+        <div class="toolbar">
+            <div class="search-wrapper">
+                <i data-lucide="search" class="search-icon"></i>
+                <input type="text" class="search-input" id="search-input"
+                    placeholder="Search horse scans by filename...">
+            </div>
+        </div>
+
+        <!-- Grid -->
+        <div class="grid" id="images-grid">
+            <!-- Dynamic items go here -->
+        </div>
+
+        <!-- Empty State -->
+        <div class="empty-state" id="empty-state" style="display: none;">
+            <div class="empty-icon">
+                <i data-lucide="alert-circle" style="width: 64px; height: 64px;"></i>
+            </div>
+            <h2>No analyzed scans found</h2>
+            <p>Make sure you have run the analysis script to generate results.</p>
+        </div>
+    </div>
+
+    <!-- Fullscreen Modal -->
+    <div class="modal" id="detail-modal">
+        <div class="modal-header">
+            <div class="modal-title-wrapper">
+                <h2 class="modal-title" id="modal-title-text">Horse Leg Scan</h2>
+                <div class="modal-subtitle" id="modal-subtitle-text">Original Scan Details</div>
+            </div>
+            <div class="close-btn" onclick="closeModal()">
+                <i data-lucide="x"></i>
+            </div>
+        </div>
+
+        <div class="modal-tabs">
+            <button class="tab-btn active" onclick="switchTab('multi-view')" id="tab-multi-view">
+                <i data-lucide="layout-grid"></i> Multi-View
+            </button>
+            <button class="tab-btn" onclick="switchTab('slider-view')" id="tab-slider-view">
+                <i data-lucide="columns"></i> Compare Slider
+            </button>
+        </div>
+
+        <!-- Multi-View Tab Content -->
+        <div class="tab-content active" id="content-multi-view">
+            <div class="panels-grid">
+                <!-- Original Image Panel -->
+                <div class="panel-card">
+                    <div class="panel-header">
+                        <i data-lucide="image" style="color: var(--accent-blue);"></i> Original Image
+                    </div>
+                    <div class="panel-img-wrapper">
+                        <img class="panel-img" id="img-original" src="" alt="Original Image">
+                    </div>
+                </div>
+
+                <!-- Silhouette Mask Panel -->
+                <div class="panel-card">
+                    <div class="panel-header">
+                        <i data-lucide="eye" style="color: white;"></i> Silhouette Mask
+                    </div>
+                    <div class="panel-img-wrapper" id="silhouette-container">
+                        <img class="panel-img" id="img-silhouette" src="" alt="Silhouette Mask">
+                    </div>
+                </div>
+
+                <!-- Foreground Extract Panel -->
+                <div class="panel-card">
+                    <div class="panel-header">
+                        <i data-lucide="scissors" style="color: var(--secondary);"></i> Extracted Foreground
+                    </div>
+                    <div class="panel-img-wrapper" id="foreground-container">
+                        <img class="panel-img" id="img-foreground" src="" alt="Extracted Foreground">
+                    </div>
+                </div>
+
+                <!-- Analyzed Symmetry Overlay Panel -->
+                <div class="panel-card">
+                    <div class="panel-header">
+                        <i data-lucide="activity" style="color: var(--accent-green);"></i> Analyzed Symmetry
+                    </div>
+                    <div class="panel-img-wrapper">
+                        <img class="panel-img" id="img-analyzed" src="" alt="Analyzed Symmetry">
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slider View Tab Content -->
+        <div class="tab-content" id="content-slider-view">
+            <div class="slider-container" id="slider-box" onmousemove="handleSliderMove(event)"
+                ontouchmove="handleSliderMoveTouch(event)">
+                <img class="slider-img slider-before" id="slider-img-before" src="" alt="Original">
+                <div class="slider-after" id="slider-clip-div"
+                    style="position: absolute; top:0; left:0; width:100%; height:100%; overflow:hidden; z-index:2;">
+                    <img class="slider-img" id="slider-img-after" src="" alt="Analyzed"
+                        style="position: absolute; top:0; left:0; width:100%; height:100%; max-width:none;">
+                </div>
+                <div class="slider-handle-bar" id="slider-handle">
+                    <div class="slider-button">
+                        <i data-lucide="arrow-left-right" style="width: 18px; height: 18px;"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- JSON Data -->
+    <script>
+        const scanData = [
+            {
+                "original": "WhatsApp Image 2026-05-18 at 15.56.44 (1).jpeg",
+                "analyzed": "WhatsApp Image 2026-05-18 at 15.56.44 (1)_analyzed.jpg",
+                "silhouette": "WhatsApp Image 2026-05-18 at 15.56.44 (1)_silhouette.png",
+                "foreground": "WhatsApp Image 2026-05-18 at 15.56.44 (1)_foreground.png",
+                "stem": "WhatsApp Image 2026-05-18 at 15.56.44 (1)"
+            },
+            {
+                "original": "WhatsApp Image 2026-05-19 at 08.36.01.jpeg",
+                "analyzed": "WhatsApp Image 2026-05-19 at 08.36.01_analyzed.jpg",
+                "silhouette": "WhatsApp Image 2026-05-19 at 08.36.01_silhouette.png",
+                "foreground": "WhatsApp Image 2026-05-19 at 08.36.01_foreground.png",
+                "stem": "WhatsApp Image 2026-05-19 at 08.36.01"
+            },
+            {
+                "original": "WhatsApp Image 2026-05-19 at 08.36.03.jpeg",
+                "analyzed": "WhatsApp Image 2026-05-19 at 08.36.03_analyzed.jpg",
+                "silhouette": "WhatsApp Image 2026-05-19 at 08.36.03_silhouette.png",
+                "foreground": "WhatsApp Image 2026-05-19 at 08.36.03_foreground.png",
+                "stem": "WhatsApp Image 2026-05-19 at 08.36.03"
+            },
+            {
+                "original": "WhatsApp Image 2026-05-19 at 08.36.22 (1).jpeg",
+                "analyzed": "WhatsApp Image 2026-05-19 at 08.36.22 (1)_analyzed.jpg",
+                "silhouette": "WhatsApp Image 2026-05-19 at 08.36.22 (1)_silhouette.png",
+                "foreground": "WhatsApp Image 2026-05-19 at 08.36.22 (1)_foreground.png",
+                "stem": "WhatsApp Image 2026-05-19 at 08.36.22 (1)"
+            },
+            {
+                "original": "WhatsApp Image 2026-05-19 at 08.36.22.jpeg",
+                "analyzed": "WhatsApp Image 2026-05-19 at 08.36.22_analyzed.jpg",
+                "silhouette": "WhatsApp Image 2026-05-19 at 08.36.22_silhouette.png",
+                "foreground": "WhatsApp Image 2026-05-19 at 08.36.22_foreground.png",
+                "stem": "WhatsApp Image 2026-05-19 at 08.36.22"
+            },
+            {
+                "original": "WhatsApp Image 2026-05-19 at 08.36.23 (1).jpeg",
+                "analyzed": "WhatsApp Image 2026-05-19 at 08.36.23 (1)_analyzed.jpg",
+                "silhouette": "WhatsApp Image 2026-05-19 at 08.36.23 (1)_silhouette.png",
+                "foreground": "WhatsApp Image 2026-05-19 at 08.36.23 (1)_foreground.png",
+                "stem": "WhatsApp Image 2026-05-19 at 08.36.23 (1)"
+            },
+            {
+                "original": "WhatsApp Image 2026-05-19 at 08.36.23.jpeg",
+                "analyzed": "WhatsApp Image 2026-05-19 at 08.36.23_analyzed.jpg",
+                "silhouette": "WhatsApp Image 2026-05-19 at 08.36.23_silhouette.png",
+                "foreground": "WhatsApp Image 2026-05-19 at 08.36.23_foreground.png",
+                "stem": "WhatsApp Image 2026-05-19 at 08.36.23"
+            },
+            {
+                "original": "WhatsApp Image 2026-05-19 at 08.36.24 (2).jpeg",
+                "analyzed": "WhatsApp Image 2026-05-19 at 08.36.24 (2)_analyzed.jpg",
+                "silhouette": "WhatsApp Image 2026-05-19 at 08.36.24 (2)_silhouette.png",
+                "foreground": "WhatsApp Image 2026-05-19 at 08.36.24 (2)_foreground.png",
+                "stem": "WhatsApp Image 2026-05-19 at 08.36.24 (2)"
+            },
+            {
+                "original": "WhatsApp Image 2026-05-19 at 08.36.24.jpeg",
+                "analyzed": "WhatsApp Image 2026-05-19 at 08.36.24_analyzed.jpg",
+                "silhouette": "WhatsApp Image 2026-05-19 at 08.36.24_silhouette.png",
+                "foreground": "WhatsApp Image 2026-05-19 at 08.36.24_foreground.png",
+                "stem": "WhatsApp Image 2026-05-19 at 08.36.24"
+            },
+            {
+                "original": "WhatsApp Image 2026-05-19 at 08.36.25.jpeg",
+                "analyzed": "WhatsApp Image 2026-05-19 at 08.36.25_analyzed.jpg",
+                "silhouette": "WhatsApp Image 2026-05-19 at 08.36.25_silhouette.png",
+                "foreground": "WhatsApp Image 2026-05-19 at 08.36.25_foreground.png",
+                "stem": "WhatsApp Image 2026-05-19 at 08.36.25"
+            },
+            {
+                "original": "WhatsApp Image 2026-05-19 at 08.36.26 (1).jpeg",
+                "analyzed": "WhatsApp Image 2026-05-19 at 08.36.26 (1)_analyzed.jpg",
+                "silhouette": "WhatsApp Image 2026-05-19 at 08.36.26 (1)_silhouette.png",
+                "foreground": "WhatsApp Image 2026-05-19 at 08.36.26 (1)_foreground.png",
+                "stem": "WhatsApp Image 2026-05-19 at 08.36.26 (1)"
+            },
+            {
+                "original": "WhatsApp Image 2026-05-19 at 08.36.26 (2).jpeg",
+                "analyzed": "WhatsApp Image 2026-05-19 at 08.36.26 (2)_analyzed.jpg",
+                "silhouette": "WhatsApp Image 2026-05-19 at 08.36.26 (2)_silhouette.png",
+                "foreground": "WhatsApp Image 2026-05-19 at 08.36.26 (2)_foreground.png",
+                "stem": "WhatsApp Image 2026-05-19 at 08.36.26 (2)"
+            },
+            {
+                "original": "WhatsApp Image 2026-05-19 at 08.36.27 (1).jpeg",
+                "analyzed": "WhatsApp Image 2026-05-19 at 08.36.27 (1)_analyzed.jpg",
+                "silhouette": "WhatsApp Image 2026-05-19 at 08.36.27 (1)_silhouette.png",
+                "foreground": "WhatsApp Image 2026-05-19 at 08.36.27 (1)_foreground.png",
+                "stem": "WhatsApp Image 2026-05-19 at 08.36.27 (1)"
+            },
+            {
+                "original": "WhatsApp Image 2026-05-19 at 08.36.27.jpeg",
+                "analyzed": "WhatsApp Image 2026-05-19 at 08.36.27_analyzed.jpg",
+                "silhouette": "WhatsApp Image 2026-05-19 at 08.36.27_silhouette.png",
+                "foreground": "WhatsApp Image 2026-05-19 at 08.36.27_foreground.png",
+                "stem": "WhatsApp Image 2026-05-19 at 08.36.27"
+            },
+            {
+                "original": "WhatsApp Image 2026-05-19 at 08.36.28 (2).jpeg",
+                "analyzed": "WhatsApp Image 2026-05-19 at 08.36.28 (2)_analyzed.jpg",
+                "silhouette": "WhatsApp Image 2026-05-19 at 08.36.28 (2)_silhouette.png",
+                "foreground": "WhatsApp Image 2026-05-19 at 08.36.28 (2)_foreground.png",
+                "stem": "WhatsApp Image 2026-05-19 at 08.36.28 (2)"
+            },
+            {
+                "original": "WhatsApp Image 2026-05-19 at 08.36.28.jpeg",
+                "analyzed": "WhatsApp Image 2026-05-19 at 08.36.28_analyzed.jpg",
+                "silhouette": "WhatsApp Image 2026-05-19 at 08.36.28_silhouette.png",
+                "foreground": "WhatsApp Image 2026-05-19 at 08.36.28_foreground.png",
+                "stem": "WhatsApp Image 2026-05-19 at 08.36.28"
+            },
+            {
+                "original": "WhatsApp Image 2026-05-19 at 08.36.29 (1).jpeg",
+                "analyzed": "WhatsApp Image 2026-05-19 at 08.36.29 (1)_analyzed.jpg",
+                "silhouette": "WhatsApp Image 2026-05-19 at 08.36.29 (1)_silhouette.png",
+                "foreground": "WhatsApp Image 2026-05-19 at 08.36.29 (1)_foreground.png",
+                "stem": "WhatsApp Image 2026-05-19 at 08.36.29 (1)"
+            },
+            {
+                "original": "WhatsApp Image 2026-05-19 at 08.36.29 (2).jpeg",
+                "analyzed": "WhatsApp Image 2026-05-19 at 08.36.29 (2)_analyzed.jpg",
+                "silhouette": "WhatsApp Image 2026-05-19 at 08.36.29 (2)_silhouette.png",
+                "foreground": "WhatsApp Image 2026-05-19 at 08.36.29 (2)_foreground.png",
+                "stem": "WhatsApp Image 2026-05-19 at 08.36.29 (2)"
+            }
+        ];
+
+        // Initialize Icons
+        lucide.createIcons();
+
+        // Render Dashboard
+        const gridElement = document.getElementById('images-grid');
+        const searchInput = document.getElementById('search-input');
+        const totalCountElement = document.getElementById('total-count');
+        const emptyState = document.getElementById('empty-state');
+
+        let activeScan = null;
+
+        function renderGrid(filterText = "") {
+            const filteredData = scanData.filter(item =>
+                item.original.toLowerCase().includes(filterText.toLowerCase())
+            );
+
+            gridElement.innerHTML = "";
+            totalCountElement.textContent = filteredData.length;
+
+            if (filteredData.length === 0) {
+                emptyState.style.display = "flex";
+                return;
+            } else {
+                emptyState.style.display = "none";
+            }
+
+            filteredData.forEach(item => {
+                const card = document.createElement('div');
+                card.className = "card";
+                card.onclick = () => openModal(item);
+
+                card.innerHTML = `
+                    <div class="card-image-wrapper">
+                        <img class="card-img" src="${item.analyzed}" alt="${item.original}">
+                        <div class="card-overlay-badge">
+                            <span class="badge-dot"></span>
+                            Analyzed
+                        </div>
+                    </div>
+                    <div class="card-content">
+                        <h3 class="card-title">${item.original}</h3>
+                        <div class="card-meta">
+                            <div class="card-meta-item">
+                                <i data-lucide="file" style="width: 14px; height: 14px;"></i>
+                                ${item.original.split('.').pop().toUpperCase()}
+                            </div>
+                        </div>
+                    </div>
+                `;
+                gridElement.appendChild(card);
+            });
+
+            lucide.createIcons();
+        }
+
+        // Search Filter
+        searchInput.addEventListener('input', (e) => {
+            renderGrid(e.target.value);
+        });
+
+        // Modal Controls
+        function openModal(item) {
+            activeScan = item;
+            document.getElementById('modal-title-text').textContent = item.original;
+            document.getElementById('modal-subtitle-text').textContent = `Details for stem: ${item.stem}`;
+
+            // Set source images
+            document.getElementById('img-original').src = item.original;
+            document.getElementById('img-analyzed').src = item.analyzed;
+
+            // Silhouette
+            const silElement = document.getElementById('img-silhouette');
+            const silContainer = document.getElementById('silhouette-container');
+            if (item.silhouette) {
+                silElement.src = item.silhouette;
+                silContainer.innerHTML = `<img class="panel-img" id="img-silhouette" src="${item.silhouette}" alt="Silhouette Mask">`;
+            } else {
+                silContainer.innerHTML = `
+                    <div class="no-data-panel">
+                        <i data-lucide="eye-off" style="width: 48px; height: 48px;"></i>
+                        <p>No Silhouette mask saved</p>
+                    </div>
+                `;
+            }
+
+            // Foreground
+            const foreElement = document.getElementById('img-foreground');
+            const foreContainer = document.getElementById('foreground-container');
+            if (item.foreground) {
+                foreElement.src = item.foreground;
+                foreContainer.innerHTML = `<img class="panel-img" id="img-foreground" src="${item.foreground}" alt="Extracted Foreground">`;
+            } else {
+                foreContainer.innerHTML = `
+                    <div class="no-data-panel">
+                        <i data-lucide="scissors" style="width: 48px; height: 48px;"></i>
+                        <p>No Foreground extract saved</p>
+                    </div>
+                `;
+            }
+
+            // Slider Images
+            document.getElementById('slider-img-before').src = item.original;
+            const sliderImgAfter = document.getElementById('slider-img-after');
+            sliderImgAfter.src = item.analyzed;
+
+            // Reset Slider Position to 50%
+            resetSlider();
+
+            const modal = document.getElementById('detail-modal');
+            modal.style.display = "flex";
+            setTimeout(() => {
+                modal.classList.add('active');
+            }, 10);
+
+            lucide.createIcons();
+        }
+
+        // Window resize adjusts slider image locks
+        window.addEventListener('resize', () => {
+            if (document.getElementById('content-slider-view').classList.contains('active')) {
+                resetSlider();
+            }
+        });
+
+        function closeModal() {
+            const modal = document.getElementById('detail-modal');
+            modal.classList.remove('active');
+            setTimeout(() => {
+                modal.style.display = "none";
+            }, 300);
+        }
+
+        // Switch Modal Tabs
+        function switchTab(tabName) {
+            // Remove active class from buttons
+            document.getElementById('tab-multi-view').classList.remove('active');
+            document.getElementById('tab-slider-view').classList.remove('active');
+
+            // Hide all contents
+            document.getElementById('content-multi-view').classList.remove('active');
+            document.getElementById('content-slider-view').classList.remove('active');
+
+            // Set active class
+            if (tabName === 'multi-view') {
+                document.getElementById('tab-multi-view').classList.add('active');
+                document.getElementById('content-multi-view').classList.add('active');
+            } else if (tabName === 'slider-view') {
+                document.getElementById('tab-slider-view').classList.add('active');
+                document.getElementById('content-slider-view').classList.add('active');
+                resetSlider();
+            }
+        }
+
+        // Slider Functionality
+        function resetSlider() {
+            const handle = document.getElementById('slider-handle');
+            const clipDiv = document.getElementById('slider-clip-div');
+            const imgAfter = document.getElementById('slider-img-after');
+            const box = document.getElementById('slider-box');
+
+            if (handle && clipDiv && box) {
+                handle.style.left = "50%";
+                clipDiv.style.width = "50%";
+
+                // Align width of clipped image to matches outer slider container
+                const boxRect = box.getBoundingClientRect();
+                imgAfter.style.width = boxRect.width + "px";
+                imgAfter.style.height = boxRect.height + "px";
+            }
+        }
+
+        function handleSliderMove(e) {
+            const box = document.getElementById('slider-box');
+            const handle = document.getElementById('slider-handle');
+            const clipDiv = document.getElementById('slider-clip-div');
+            const imgAfter = document.getElementById('slider-img-after');
+
+            const rect = box.getBoundingClientRect();
+            let x = e.clientX - rect.left;
+
+            // Constraints
+            if (x < 0) x = 0;
+            if (x > rect.width) x = rect.width;
+
+            const percent = (x / rect.width) * 100;
+            handle.style.left = percent + "%";
+            clipDiv.style.width = percent + "%";
+
+            // Lock size of absolute positioned image to match container
+            imgAfter.style.width = rect.width + "px";
+            imgAfter.style.height = rect.height + "px";
+        }
+
+        function handleSliderMoveTouch(e) {
+            const box = document.getElementById('slider-box');
+            const handle = document.getElementById('slider-handle');
+            const clipDiv = document.getElementById('slider-clip-div');
+            const imgAfter = document.getElementById('slider-img-after');
+
+            const rect = box.getBoundingClientRect();
+            let touch = e.touches[0];
+            let x = touch.clientX - rect.left;
+
+            if (x < 0) x = 0;
+            if (x > rect.width) x = rect.width;
+
+            const percent = (x / rect.width) * 100;
+            handle.style.left = percent + "%";
+            clipDiv.style.width = percent + "%";
+
+            imgAfter.style.width = rect.width + "px";
+            imgAfter.style.height = rect.height + "px";
+        }
+
+        // First Render
+        renderGrid();
+    </script>
+</body>
+
+</html>

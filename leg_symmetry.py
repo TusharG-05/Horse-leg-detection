@@ -15,24 +15,26 @@ Usage:
 import cv2
 import numpy as np
 import sys
+import argparse
+import glob
+import os
 from pathlib import Path
 from rembg import remove
 
 # ──────────────────────────────────────────────
 # 1. BACKGROUND REMOVAL (Using rembg with performance scaling)
 # ──────────────────────────────────────────────
-def extract_foreground_mask(image_bgr):
+def extract_foreground_mask(image_bgr, do_downscale=True, max_dim=1000):
     """
     Uses rembg to remove the background and extract a clean binary mask 
     of the horse's silhouette. Performs downscaling on large images 
     for major speedup.
     """
     h, w = image_bgr.shape[:2]
-    
-    # Target maximum dimension for rembg processing (performance scaling)
-    MAX_DIM = 1000
-    if max(h, w) > MAX_DIM:
-        scale = MAX_DIM / max(h, w)
+
+    # Downscale only when requested to speed up rembg processing on large images
+    if do_downscale and max_dim and max(h, w) > max_dim:
+        scale = max_dim / max(h, w)
         new_w = int(w * scale)
         new_h = int(h * scale)
         print(f"[INFO] Downscaling image from {w}x{h} to {new_w}x{new_h} for fast background isolation...")
@@ -302,9 +304,27 @@ def apply_overlay(original_bgr, green_mask, red_mask, alpha=0.55):
     return np.clip(result, 0, 255).astype(np.uint8)
 
 # ──────────────────────────────────────────────
+def clean_previous_outputs(directories):
+    """Remove previously generated outputs in the given directories.
+
+    Patterns removed: *_analyzed*, *_foreground*, *_silhouette*, *_cropped_*
+    """
+    patterns = ["*_analyzed*", "*_foreground*", "*_silhouette*", "*_cropped_*"]
+    for d in directories:
+        dpath = Path(d)
+        if not dpath.is_dir():
+            continue
+        for pat in patterns:
+            for f in dpath.glob(pat):
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+
+
 # 6. MAIN PIPELINE
 # ──────────────────────────────────────────────
-def process_image(input_path):
+def process_image(input_path, do_downscale=True, max_dim=1000):
     input_path = Path(input_path)
     image = cv2.imread(str(input_path))
     if image is None:
@@ -314,7 +334,7 @@ def process_image(input_path):
     print(f"\n[INFO] Processing: {input_path.name} ({w}x{h})")
 
     # 1. Background removal to get binary silhouette (with scaling)
-    mask = extract_foreground_mask(image)
+    mask = extract_foreground_mask(image, do_downscale=do_downscale, max_dim=max_dim)
 
     # Save silhouette and foreground (background removed) images
     silhouette_path = input_path.parent / f"{input_path.stem}_silhouette.png"
@@ -389,13 +409,30 @@ def process_image(input_path):
 
 
 if __name__ == "__main__":
-    args = sys.argv[1:]
-    if not args:
-        print("Usage: python leg_symmetry.py image1.jpg [image2.jpg ...]")
+    parser = argparse.ArgumentParser(description="Horse Leg Symmetry Analyzer")
+    parser.add_argument("images", nargs="+", help="Image files or glob patterns")
+    parser.add_argument("--no-downscale", action="store_true", help="Do not downscale images before running rembg (slower, but higher fidelity)")
+    parser.add_argument("--max-dim", type=int, default=1000, help="Maximum dimension for downscaling (default: 1000)")
+    args = parser.parse_args()
+
+    # Expand glob patterns and collect unique directories to clean
+    expanded = []
+    dirs = set()
+    for pat in args.images:
+        for p in glob.glob(pat):
+            expanded.append(p)
+            dirs.add(str(Path(p).parent))
+
+    if not expanded:
+        print("No images found for the provided patterns.")
         sys.exit(0)
 
-    for img_path in args:
+    # Always remove previous generated outputs in each input directory
+    clean_previous_outputs(dirs)
+
+    do_downscale = not args.no_downscale
+    for img_path in expanded:
         try:
-            process_image(img_path)
+            process_image(img_path, do_downscale=do_downscale, max_dim=args.max_dim)
         except Exception as e:
             print(f"[ERROR] Failed processing {img_path}: {e}")

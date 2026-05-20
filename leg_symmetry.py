@@ -119,37 +119,73 @@ def get_leg_contours(mask):
     then finding the downward-extending contours.
     """
     h, w = mask.shape
-    
+
     # Dynamically find the Y-coordinate where the legs split from the body trunk
     roi_top = find_split_row(mask)
     print(f"[INFO] Dynamic crotch split row detected at Y = {roi_top} (approx. {roi_top/h*100:.1f}% height)")
-    
+
     leg_only_mask = np.zeros_like(mask)
     leg_only_mask[roi_top:] = mask[roi_top:]
 
     # Find distinct blobs
     contours, _ = cv2.findContours(leg_only_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    legs = []
+
+    props = []
     min_area = h * w * 0.0015  # Ignore tiny noise
-
     for cnt in contours:
-        _, y, cw, ch = cv2.boundingRect(cnt)
+        x, y, cw, ch = cv2.boundingRect(cnt)
         area = cv2.contourArea(cnt)
-
         if area < min_area:
             continue
+        bottom = y + ch
+        M = cv2.moments(cnt)
+        cx = int(M['m10'] / M['m00']) if M.get('m00', 0) != 0 else x + cw // 2
+        props.append({'cnt': cnt, 'area': area, 'x': x, 'y': y, 'w': cw, 'h': ch, 'bottom': bottom, 'cx': cx})
 
+    if not props:
+        return []
+
+    # Bottom-anchor filter: prefer contours that reach near the image bottom
+    max_bottom = max(p['bottom'] for p in props)
+    bottom_tol = int(h * 0.10)  # 10% of image height tolerance
+    candidates = [p for p in props if p['bottom'] >= (max_bottom - bottom_tol)]
+
+    # Relax tolerance if nothing remains
+    if not candidates:
+        bottom_tol = int(h * 0.25)
+        candidates = [p for p in props if p['bottom'] >= (max_bottom - bottom_tol)]
+
+    # Scoring: area, bottom proximity and closeness to image center
+    max_area = max(p['area'] for p in props)
+    img_cx = w / 2.0
+    for p in candidates:
+        area_norm = p['area'] / max_area if max_area > 0 else 0
+        bottom_norm = p['bottom'] / h
+        center_prox = 1.0 - (abs(p['cx'] - img_cx) / (w / 2.0))
+        p['score'] = area_norm * 0.6 + bottom_norm * 0.3 + center_prox * 0.1
+
+    candidates.sort(key=lambda p: p['score'], reverse=True)
+
+    # Keep top 2 candidates (most likely front legs)
+    selected = [p['cnt'] for p in candidates[:2]]
+
+    # Final heuristics: ensure selected contours are vertically leg-like
+    filtered = []
+    for cnt in selected:
+        x, y, cw, ch = cv2.boundingRect(cnt)
         aspect = ch / max(cw, 1)
         bottom = y + ch
-        
-        # Heuristics: It must be taller than it is wide, and reach the bottom half
-        if aspect > 1.1 and bottom > h * 0.50:
-            legs.append(cnt)
+        if aspect > 1.0 and bottom > h * 0.40:
+            filtered.append(cnt)
+
+    # If nothing passes final heuristics, fallback to the largest by area
+    if not filtered and props:
+        props.sort(key=lambda p: p['area'], reverse=True)
+        filtered = [props[0]['cnt']]
 
     # Sort left to right
-    legs.sort(key=lambda c: cv2.boundingRect(c)[0])
-    return legs
+    filtered.sort(key=lambda c: cv2.boundingRect(c)[0])
+    return filtered
 
 # ──────────────────────────────────────────────
 # 3. CENTER AXIS (Enforces Vertical midline at Fetlock joint center)

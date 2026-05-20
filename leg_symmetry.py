@@ -161,23 +161,39 @@ def find_center_x(leg_mask, x, y, cw, ch):
     in the 40% to 65% region of the leg height (fully excluding the flared hoof below).
     """
     h, _ = leg_mask.shape
-    start_y = y + int(ch * 0.40)
-    end_y = y + int(ch * 0.65)
-    
-    max_width = 0
-    best_cx = x + cw // 2
-    
-    for row_y in range(max(0, start_y), min(h, end_y)):
-        pixels = np.nonzero(leg_mask[row_y])[0]
+
+    # Use a wider, adaptive search band so fetlock + lower cannon are preferred
+    start_y = max(0, y + int(ch * 0.20))
+    end_y = min(h, y + int(ch * 0.75))
+
+    # Morphological closing to fill small holes and stabilise width measurements
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    clean = cv2.morphologyEx(leg_mask, cv2.MORPH_CLOSE, kernel)
+
+    rows = []
+    widths = []
+    for row_y in range(start_y, end_y):
+        pixels = np.nonzero(clean[row_y])[0]
         if len(pixels) >= 2:
             lx = pixels[0]
             rx = pixels[-1]
-            width = rx - lx
-            if width > max_width:
-                max_width = width
-                best_cx = int((lx + rx) / 2)
-                
-    return best_cx
+            widths.append(rx - lx)
+            rows.append((row_y, lx, rx))
+
+    if widths:
+        arr = np.array(widths, dtype=np.float32)
+        # Smooth to avoid selecting noisy single-row peaks
+        if len(arr) >= 5:
+            arr = np.convolve(arr, np.ones(5)/5, mode='same')
+        idx = int(np.argmax(arr))
+        row_y, lx, rx = rows[idx]
+        return int((lx + rx) / 2)
+
+    # Fallbacks
+    M = cv2.moments(leg_mask)
+    if M.get('m00', 0) != 0:
+        return int(M['m10'] / M['m00'])
+    return x + cw // 2
 
 # ──────────────────────────────────────────────
 # 4. ROW-BY-ROW SYMMETRY ANALYSIS

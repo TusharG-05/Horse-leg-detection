@@ -269,6 +269,18 @@ def find_center_x(leg_mask, x, y, cw, ch):
             filt = centers[np.abs(centers - med) <= tol]
             if filt.size >= 1:
                 med = float(np.median(filt))
+
+            # Ensure the computed median lies meaningfully inside the leg bbox.
+            # If it falls outside or too close to the bbox edge, fallback to bbox center.
+            min_cx = x + int(max(1, cw * 0.08))
+            max_cx = x + cw - int(max(1, cw * 0.08))
+            if min_cx >= max_cx:
+                min_cx = x
+                max_cx = x + cw
+
+            if med < min_cx or med > max_cx:
+                med = float(x + cw // 2)
+
             return int(round(med))
 
     # Fallbacks
@@ -305,24 +317,37 @@ def analyze_symmetry(leg_mask, center_x, y, ch, h, w):
         rw = rx - center_x   # Width on right of axis
         sw = min(lw, rw)     # The symmetric matching width
 
-        # Paint GREEN (symmetric part)
+        # Paint GREEN (symmetric part) but only where the leg actually exists
         g_start = max(0, center_x - sw)
         g_end = min(w, center_x + sw + 1)
-        green[row_y, g_start:g_end] = 255
+        # Only paint symmetric region where leg_mask has pixels
+        sym_region = np.zeros(w, dtype=np.uint8)
+        sym_region[g_start:g_end] = 255
+        leg_row = (leg_mask[row_y] > 0).astype(np.uint8) * 255
+        green[row_y] = np.maximum(green[row_y], np.bitwise_and(sym_region, leg_row))
 
-        # Paint RED (asymmetric part - whichever side is wider)
+        # Paint RED (asymmetric part - whichever side is wider), clipped to leg
         if lw > rw: # Left side is wider
             r_start = max(0, lx)
             r_end = max(0, center_x - sw)
             if r_start < r_end:
-                red[row_y, r_start:r_end] = 255
+                asym = np.zeros(w, dtype=np.uint8)
+                asym[r_start:r_end] = 255
+                red[row_y] = np.maximum(red[row_y], np.bitwise_and(asym, leg_row))
         elif rw > lw: # Right side is wider
             r_start = min(w, center_x + sw + 1)
             r_end = min(w, rx + 1)
             if r_start < r_end:
-                red[row_y, r_start:r_end] = 255
+                asym = np.zeros(w, dtype=np.uint8)
+                asym[r_start:r_end] = 255
+                red[row_y] = np.maximum(red[row_y], np.bitwise_and(asym, leg_row))
+
+    # Clip painted areas to the original leg mask as a final safety net
+    green = np.bitwise_and(green, leg_mask)
+    red = np.bitwise_and(red, leg_mask)
 
     return green, red
+
 
 # ──────────────────────────────────────────────
 # 5. COLOUR OVERLAY

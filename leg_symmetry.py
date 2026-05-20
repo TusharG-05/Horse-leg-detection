@@ -164,7 +164,10 @@ def get_leg_contours(mask):
         area_norm = p['area'] / max_area if max_area > 0 else 0
         bottom_norm = p['bottom'] / h
         center_prox = 1.0 - (abs(p['cx'] - img_cx) / (w / 2.0))
-        p['score'] = area_norm * 0.6 + bottom_norm * 0.3 + center_prox * 0.1
+        height_norm = p['h'] / h
+        # Penalize tiny hoof-only blobs (likely not full leg)
+        size_penalty = 0.5 if p['h'] < (h * 0.12) else 1.0
+        p['score'] = (area_norm * 0.55 + bottom_norm * 0.25 + center_prox * 0.1 + height_norm * 0.1) * size_penalty
 
     candidates.sort(key=lambda p: p['score'], reverse=True)
 
@@ -194,38 +197,79 @@ def get_leg_contours(mask):
 # ──────────────────────────────────────────────
 def find_center_x(leg_mask, x, y, cw, ch):
     """
-    Finds the vertical center line based on the center of the metacarpophalangeal joint
-    of the horse leg. The joint is located by finding the maximum horizontal width
-    in the 40% to 65% region of the leg height (fully excluding the flared hoof below).
+    Finds the vertical center line based on the cannon bone shaft rather than the
+    full leg mask. The cannon bone is typically the straighter, narrower region
+    above the fetlock and below the knee, so we estimate the center from that band.
     """
-    h, _ = leg_mask.shape
-
-    # Use a wider, adaptive search band so fetlock + lower cannon are preferred
-    start_y = max(0, y + int(ch * 0.20))
-    end_y = min(h, y + int(ch * 0.75))
+    h, w = leg_mask.shape
 
     # Morphological closing to fill small holes and stabilise width measurements
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     clean = cv2.morphologyEx(leg_mask, cv2.MORPH_CLOSE, kernel)
 
-    rows = []
-    widths = []
-    for row_y in range(start_y, end_y):
+    # Search a vertical span that likely contains the cannon shaft. We start
+    # a bit above the provided bounding box (in case the bounding box is
+    # truncated to the hoof) and scan upwards to find a narrow, consistent
+    # band (the shaft).
+    search_top = max(0, y - int(ch * 0.6))
+    search_bot = min(h, y + ch)
+
+    row_infos = []  # list of (row_y, lx, rx, width)
+    for row_y in range(search_top, search_bot):
         pixels = np.nonzero(clean[row_y])[0]
         if len(pixels) >= 2:
-            lx = pixels[0]
-            rx = pixels[-1]
-            widths.append(rx - lx)
-            rows.append((row_y, lx, rx))
+            lx = int(pixels[0])
+            rx = int(pixels[-1])
+            row_infos.append((row_y, lx, rx, rx - lx))
 
-    if widths:
-        arr = np.array(widths, dtype=np.float32)
-        # Smooth to avoid selecting noisy single-row peaks
-        if len(arr) >= 5:
-            arr = np.convolve(arr, np.ones(5)/5, mode='same')
-        idx = int(np.argmax(arr))
-        row_y, lx, rx = rows[idx]
-        return int((lx + rx) / 2)
+    if row_infos:
+        # Smooth widths using a simple median filter over neighboring rows
+        widths = np.array([r[3] for r in row_infos], dtype=np.float32)
+        smoothed = np.copy(widths)
+        kernel_win = 11
+        half = kernel_win // 2
+        for i in range(len(widths)):
+            lo = max(0, i - half)
+            hi = min(len(widths), i + half + 1)
+            smoothed[i] = float(np.median(widths[lo:hi]))
+
+        # Find a sliding window of rows with the lowest mean smoothed width
+        win = max(5, min(25, int(len(smoothed) * 0.2)))
+        best_idx = None
+        best_val = float('inf')
+        for i in range(0, len(smoothed) - win + 1):
+            val = float(np.mean(smoothed[i:i+win]))
+            if val < best_val:
+                best_val = val
+                best_idx = i
+
+        centers = []
+        if best_idx is not None:
+            for j in range(best_idx, min(best_idx + win, len(row_infos))):
+                _, lx, rx, _ = row_infos[j]
+                centers.append((lx + rx) / 2.0)
+
+        # Fallback: if sliding-window fails, try percentile-based narrow rows
+        if not centers:
+            widths_arr = np.array([r[3] for r in row_infos], dtype=np.float32)
+            pct = 50
+            shaft_rows = []
+            while pct <= 80 and not shaft_rows:
+                width_limit = np.percentile(widths_arr, pct)
+                shaft_rows = [r for r in row_infos if r[3] <= width_limit]
+                pct += 10
+            if not shaft_rows:
+                shaft_rows = row_infos
+            centers = [ (lx + rx) / 2.0 for (_, lx, rx, _) in shaft_rows ]
+
+        if centers:
+            centers = np.array(centers, dtype=np.float32)
+            med = float(np.median(centers))
+            tol = max(1.0, w * 0.08)
+            filt = centers[np.abs(centers - med) <= tol]
+            if filt.size >= 1:
+                med = float(np.median(filt))
+            return int(round(med))
 
     # Fallbacks
     M = cv2.moments(leg_mask)

@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "/home/harpreet/Documents/image scan/leg_symmetry_v4.py", line 70, in <module>
+    from rembg import remove
+ModuleNotFoundError: No module named 'rembg'

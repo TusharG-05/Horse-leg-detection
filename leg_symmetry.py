@@ -1,19 +1,3 @@
-#!/usr/bin/env python3
-"""
-Minimal Horse Leg Symmetry Analyzer
-----------------------------------
-This simplified script keeps only the essential pipeline needed for your
-use-case:
-
-- Remove background at full resolution (no downscaling).
-- Heuristically select the front leg (largest lower-half contour near image center).
-- Find the cannon-bone centre-line and extend it to include the hoof rim.
-- Split the leg by the centre-line, mark the non-dominant side green, and
-  mark asymmetric extra pixels on the dominant side red.
-
-This version removes AI/model dependencies and extra assignment logic
-so it's easier to tune and reason about.
-"""
 
 from pathlib import Path
 import glob
@@ -25,16 +9,18 @@ import sys
 from PIL import Image as PILImage
 from rembg import remove
 from transformers import pipeline as hf_pipeline
-# Optional AI-based keypoint detector (MMPose). Import if available.
-try:
-    from mmpose.apis import MMPoseInferencer
-except Exception:
-    MMPoseInferencer = None
+from mmpose.apis import MMPoseInferencer
+
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
 _DEPTH_MODEL_ID = "depth-anything/Depth-Anything-V2-Small-hf"
 _depth_pipe = None
+
+
+# ---------------------------------------------------------------------------
+# Depth estimation
+# ---------------------------------------------------------------------------
 
 def get_depth_pipe():
     global _depth_pipe
@@ -44,51 +30,50 @@ def get_depth_pipe():
         logging.info("Depth Anything V2 ready.")
     return _depth_pipe
 
-def estimate_depth(image_bgr: np.ndarray) -> np.ndarray:
-    """Depth Anything V2 → float32 depth map [0,1].  1.0 = closest."""
+
+def estimate_depth(image_bgr: np.ndarray,
+                   fg_mask: np.ndarray | None = None) -> np.ndarray:
+    """Depth Anything V2 → float32 depth map [0, 1].  1.0 = closest.
+
+    FIX #1: Background pixels are filled with neutral gray (127) before
+    inference so the model is not confused by black zeros.  After inference,
+    depth outside fg_mask is zeroed so only horse pixels contribute to scoring.
+    """
+    h, w = image_bgr.shape[:2]
+
+    if fg_mask is not None:
+        input_img = image_bgr.copy()
+        input_img[fg_mask == 0] = 127
+    else:
+        input_img = image_bgr
+
     logging.info("Running Depth Anything V2 …")
-    rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    rgb = cv2.cvtColor(input_img, cv2.COLOR_BGR2RGB)
     pil_img = PILImage.fromarray(rgb)
     result = get_depth_pipe()(pil_img)
-    depth_pil = result["depth"]
-    depth_np = np.array(depth_pil).astype(np.float32)
-    h, w = image_bgr.shape[:2]
+    depth_np = np.array(result["depth"]).astype(np.float32)
+
     if depth_np.shape[0] != h or depth_np.shape[1] != w:
         depth_np = cv2.resize(depth_np, (w, h), interpolation=cv2.INTER_LINEAR)
+
     d_min, d_max = depth_np.min(), depth_np.max()
-    if d_max > d_min:
-        depth_np = (depth_np - d_min) / (d_max - d_min)
-    else:
-        depth_np = np.zeros_like(depth_np)
+    depth_np = (depth_np - d_min) / (d_max - d_min) if d_max > d_min else np.zeros_like(depth_np)
+
+    if fg_mask is not None:
+        depth_np[fg_mask == 0] = 0.0
+
     logging.info("Depth map ready (shape=%s).", depth_np.shape)
     return depth_np
 
-def extract_foreground_mask(image_bgr: np.ndarray) -> np.ndarray:
-    """Run rembg at full resolution and return a cleaned binary mask.
 
-    Uses a permissive alpha threshold and morphological ops to keep thin
-    structures like fetlock and hoof rim.
-    """
-    h, w = image_bgr.shape[:2]
-    logging.info("Running rembg on image at full resolution (%dx%d)", w, h)
-    rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    rgba = remove(rgb)
-    if rgba is None or rgba.ndim < 3 or rgba.shape[2] < 4:
-        raise RuntimeError("rembg returned unexpected result")
-    alpha = rgba[:, :, 3]
-    _, mask = cv2.threshold(alpha, 10, 255, cv2.THRESH_BINARY)
-
-    # close and dilate to preserve hoof/fetlock connections
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
-    mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), iterations=1)
-    return mask.astype(np.uint8)
-
+# ---------------------------------------------------------------------------
+# Foreground extraction
+# ---------------------------------------------------------------------------
 
 def extract_foreground_rgba(image_bgr: np.ndarray) -> tuple:
-    """Run rembg and return (rgba_rgb, mask_uint8).
+    """Run rembg and return (rgba HxWx4, mask uint8).
 
-    `rgba_rgb` is an HxWx4 numpy array in RGB order as returned by rembg.
+    FIX #11: saves RGBA with transparency instead of black background.
     """
     h, w = image_bgr.shape[:2]
     logging.info("Running rembg on image at full resolution (%dx%d)", w, h)
@@ -98,30 +83,37 @@ def extract_foreground_rgba(image_bgr: np.ndarray) -> tuple:
         raise RuntimeError("rembg returned unexpected result")
     alpha = rgba[:, :, 3]
     _, mask = cv2.threshold(alpha, 10, 255, cv2.THRESH_BINARY)
-
-    # close and dilate to preserve hoof/fetlock connections
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
     mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), iterations=1)
     return rgba, mask.astype(np.uint8)
 
 
-def split_mask_on_width(mask_region: np.ndarray, min_narrow_frac: float = 0.6,
-                        min_width_px: int = 30, debug: bool = False) -> list:
-    """Split a mask at rows where width narrows sharply (touching-leg separation). Bug 7 fix."""
+# ---------------------------------------------------------------------------
+# FIX #7 — split_mask_on_width (module level)
+# ---------------------------------------------------------------------------
+
+def split_mask_on_width(mask_region: np.ndarray,
+                        min_narrow_frac: float = 0.6,
+                        min_width_px: int = 30,
+                        debug: bool = False) -> list[np.ndarray]:
+    """Split a mask at narrow 'waist' rows; return component masks sorted by area desc."""
     ys = np.where(np.any(mask_region > 0, axis=1))[0]
     if ys.size == 0:
         return [mask_region]
     y0, y1 = int(ys[0]), int(ys[-1])
+
     widths = np.zeros(y1 - y0 + 1, dtype=np.int32)
     for i, ry in enumerate(range(y0, y1 + 1)):
         xs = np.where(mask_region[ry] > 0)[0]
         widths[i] = int(xs[-1] - xs[0]) if xs.size >= 2 else 0
+
     nonzero = widths[widths > 0]
     if nonzero.size == 0:
         return [mask_region]
     median_w = int(np.median(nonzero))
     thresh = max(min_width_px, int(median_w * min_narrow_frac))
+
     narrow = widths < thresh
     cut_rows = []
     i = 0
@@ -134,11 +126,15 @@ def split_mask_on_width(mask_region: np.ndarray, min_narrow_frac: float = 0.6,
             i = j + 1
         else:
             i += 1
+
     if not cut_rows:
         return [mask_region]
+
     split = mask_region.copy()
+    pad = 2
     for r in cut_rows:
-        split[max(y0, r - 2): min(y1, r + 2) + 1, :] = 0
+        split[max(y0, r - pad): min(y1, r + pad) + 1, :] = 0
+
     num_labels, labels = cv2.connectedComponents(split)
     parts = []
     for lab in range(1, num_labels):
@@ -146,6 +142,7 @@ def split_mask_on_width(mask_region: np.ndarray, min_narrow_frac: float = 0.6,
         part[labels == lab] = 255
         if cv2.countNonZero(part) > 50:
             parts.append(part)
+
     if not parts:
         return [mask_region]
     parts.sort(key=lambda m: cv2.countNonZero(m), reverse=True)
@@ -155,101 +152,220 @@ def split_mask_on_width(mask_region: np.ndarray, min_narrow_frac: float = 0.6,
     return parts
 
 
-def select_front_leg_fallback(mask: np.ndarray, depth_map: np.ndarray | None = None,
-                              debug: bool = False) -> np.ndarray | None:
-    """Select the front leg contour from the lower half of the mask.
+# ---------------------------------------------------------------------------
+# FIX #9 (ACTIVATED) — depth-based foreground prefilter
+# ---------------------------------------------------------------------------
 
-    Bug 2 fix: scores candidates by avg depth when depth_map is provided.
-    Bug 3 fix: rejects tails via aspect-ratio and ground-reach filters.
-    Bug 7 fix: calls split_mask_on_width to separate touching legs.
+def depth_prefilter_mask(mask: np.ndarray,
+                          depth_map: np.ndarray,
+                          percentile: float = 25.0) -> np.ndarray:
+    """Remove far/back-leg pixels from the foreground mask before leg selection.
+
+    Keeps foreground pixels whose depth >= the Nth percentile of foreground
+    depths.  In front-on shots this drops the back leg (blue in TURBO) while
+    keeping the front leg (orange/red).
+
+    FIX #12 — percentile lowered from 50 → 25.
+    When the camera is at ground level pointing upward the hoof is the closest
+    point (depth ≈ 1.0) while the cannon bone is further away (depth ≈ 0.4–0.6).
+    A 50th-percentile threshold sits exactly at the hoof/cannon-bone boundary,
+    stripping the cannon bone entirely.  25th-percentile keeps the vast majority
+    of the front leg while still discarding the clearly-far back leg pixels.
+
+    FIX #13 — height-preservation safety guard.
+    The existing pixel-count guard (< 15 %) does not catch the case where the
+    top of the leg is cut off (cannon bone has low pixel count relative to the
+    wide hoof).  An additional check compares the bounding-box HEIGHT of the
+    filtered mask to the original: if height shrinks by more than 35 % the
+    filter is discarding the top of the leg, so the original is returned.
+    """
+    fg_depths = depth_map[mask > 0]
+    if fg_depths.size == 0:
+        return mask
+
+    # Record original bounding-box height for the height-safety check
+    ys_orig = np.where(np.any(mask > 0, axis=1))[0]
+    orig_height = int(ys_orig[-1] - ys_orig[0]) if ys_orig.size >= 2 else 0
+
+    thresh = float(np.percentile(fg_depths, percentile))
+    filtered = np.zeros_like(mask)
+    filtered[(mask > 0) & (depth_map >= thresh)] = 255
+
+    # Close small gaps so the kept region stays contiguous
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    filtered = cv2.morphologyEx(filtered, cv2.MORPH_CLOSE, k)
+
+    # Safety guard 1: pixel count (original)
+    if cv2.countNonZero(filtered) < cv2.countNonZero(mask) * 0.15:
+        logging.warning("depth_prefilter_mask: pixel count too small — returning original mask.")
+        return mask
+
+    # Safety guard 2 (FIX #13): height preservation
+    # If the filter is cutting off the top of the leg the bounding-box height
+    # shrinks.  More than 35 % shrinkage means the cannon bone is being lost.
+    if orig_height > 0:
+        ys_filt = np.where(np.any(filtered > 0, axis=1))[0]
+        if ys_filt.size >= 2:
+            filt_height = int(ys_filt[-1] - ys_filt[0])
+            if filt_height < orig_height * 0.65:
+                logging.warning(
+                    "depth_prefilter_mask: height shrank to %.0f%% (orig=%d filt=%d) "
+                    "— top of leg cut off; returning original mask.",
+                    100.0 * filt_height / orig_height, orig_height, filt_height)
+                return mask
+
+    logging.info("depth_prefilter_mask: kept %.1f%% of fg pixels (thresh depth=%.3f)",
+                 100.0 * cv2.countNonZero(filtered) / max(1, cv2.countNonZero(mask)), thresh)
+    return filtered
+
+
+# ---------------------------------------------------------------------------
+# FIX #3 — tail rejection helper
+# ---------------------------------------------------------------------------
+
+def is_likely_tail(contour: np.ndarray, mask: np.ndarray) -> bool:
+    """Return True if contour resembles a tail rather than a leg."""
+    x, y, cw, ch = cv2.boundingRect(contour)
+    h_img, w_img = mask.shape
+    if ch == 0:
+        return False
+
+    aspect = ch / max(cw, 1)
+    if aspect > 6 and cw < w_img * 0.07:
+        return True
+
+    top_end = y + max(1, int(ch * 0.20))
+    bot_start = y + int(ch * 0.80)
+    top_ws, bot_ws = [], []
+    for ry in range(y, min(top_end + 1, h_img)):
+        xs = np.where(mask[ry] > 0)[0]
+        if xs.size >= 2:
+            top_ws.append(int(xs[-1] - xs[0]))
+    for ry in range(bot_start, min(y + ch + 1, h_img)):
+        xs = np.where(mask[ry] > 0)[0]
+        if xs.size >= 2:
+            bot_ws.append(int(xs[-1] - xs[0]))
+
+    if top_ws and bot_ws:
+        avg_top = float(np.mean(top_ws))
+        avg_bot = float(np.mean(bot_ws))
+        if avg_bot < avg_top * 0.45 and avg_bot < w_img * 0.04:
+            return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Leg selection — fallback (no MMPose)
+# ---------------------------------------------------------------------------
+
+def select_front_leg_fallback(mask: np.ndarray,
+                               depth_map: np.ndarray | None = None,
+                               debug: bool = False) -> np.ndarray | None:
+    """Select the frontmost front leg using depth + heuristics.
+
+    Receives depth-filtered mask (FIX #9) so back-leg pixels are already
+    removed before this function runs.
     """
     h, w = mask.shape
     zone = np.zeros_like(mask)
-    zone[int(h * 0.35):] = mask[int(h * 0.35):]
-    contours, _ = cv2.findContours(zone, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
+    # FIX #14: zone cutoff lowered from 35% → 20% of image height.
+    # At 35% the cannon bone (which starts at ~20-30% from the top in
+    # ground-level shots) was sometimes excluded from the candidate region.
+    zone[int(h * 0.20):] = mask[int(h * 0.20):]
+
+    raw_contours, _ = cv2.findContours(zone, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not raw_contours:
         return None
+
+    combined = np.zeros_like(mask)
+    for cnt in raw_contours:
+        if cv2.contourArea(cnt) >= 500:
+            cv2.drawContours(combined, [cnt], -1, 255, cv2.FILLED)
+
+    parts = split_mask_on_width(combined,
+                                min_narrow_frac=0.55,
+                                min_width_px=max(20, int(0.05 * w)),
+                                debug=debug)
+
+    if len(parts) == 1 and cv2.countNonZero(parts[0]) > (h * w * 0.03):
+        hooves = []
+        for cnt in raw_contours:
+            if cv2.contourArea(cnt) < 500:
+                continue
+            bx, by, bw, bh = cv2.boundingRect(cnt)
+            hooves.append((float(bx + bw // 2), float(min(by + bh + 20, h - 1))))
+        if len(hooves) >= 2:
+            ws_parts = seed_watershed_from_hooves(combined, hooves)
+            ws_parts = [p for p in ws_parts if p is not None and cv2.countNonZero(p) > 50]
+            if len(ws_parts) > len(parts):
+                logging.info("Watershed separated %d parts from touching-leg blob", len(ws_parts))
+                parts = ws_parts
 
     img_cx = w / 2.0
     candidates = []
-    for cnt in contours:
+    for part in parts:
+        cnts, _ = cv2.findContours(part, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            continue
+        cnt = max(cnts, key=cv2.contourArea)
         area = cv2.contourArea(cnt)
         if area < 500:
             continue
-        x, y, cw, ch = cv2.boundingRect(cnt)
-        # Bug 2/3 adjustment: measure depth first to use it as an override for shape filters
+
+        if is_likely_tail(cnt, part):
+            if debug:
+                logging.info("Rejected tail-like contour (area=%.0f)", area)
+            continue
+
+        bx, by, bw, bh = cv2.boundingRect(cnt)
+        cx_part = bx + bw / 2.0
+        dx = abs(cx_part - img_cx)
+
+        bottom_width = 0
+        for ry in range(by + int(bh * 0.75), min(by + bh + 1, h)):
+            xs = np.where(part[ry] > 0)[0]
+            if xs.size > 0:
+                bottom_width = max(bottom_width, int(xs[-1] - xs[0]))
+
         avg_depth = 0.0
         if depth_map is not None:
-            cm = np.zeros_like(mask)
-            cv2.drawContours(cm, [cnt], -1, 255, cv2.FILLED)
-            ov = (cm > 0) & (mask > 0)
-            if np.any(ov):
-                avg_depth = float(depth_map[ov].mean())
+            fg_px = part > 0
+            if np.any(fg_px):
+                avg_depth = float(depth_map[fg_px].mean())
 
-        # Bug 3: reject blobs that don't reach low enough (tail/body filter)
-        # Relax requirement (80% -> 50% height) if it's very close to camera (high depth)
-        # Lowered depth threshold to 0.40 because red/orange legs can score around ~0.50
-        req_bottom = 0.80 * h if avg_depth < 0.40 else 0.50 * h
-        if (y + ch) < int(req_bottom):
-            if debug:
-                logging.info("fallback reject (tail/body): bottom=%d < req=%.0f (depth=%.3f)", y + ch, req_bottom, avg_depth)
-            continue
-        # Bug 3: reject blobs that are too wide relative to height (not leg-shaped)
-        # Relax requirement for frontmost objects (cropped legs can have squatter bounding boxes)
-        max_ratio = 0.65 if avg_depth < 0.40 else 0.90
-        if ch == 0 or (cw / ch) > max_ratio:
-            if debug:
-                logging.info("fallback reject (aspect): cw/ch=%.2f > req=%.2f (depth=%.3f)", cw / ch if ch else 999, max_ratio, avg_depth)
-            continue
-        cx_cnt = x + cw / 2.0
-        dx = abs(cx_cnt - img_cx)
-        scan_start = y + int(ch * 0.75)
-        scan_end = min(h - 1, y + ch - 1)
-        bottom_width = 0
-        for ry in range(scan_start, scan_end + 1):
-            xs_row = np.where(mask[ry] > 0)[0]
-            if xs_row.size > 0:
-                bottom_width = max(bottom_width, int(xs_row[-1] - xs_row[0]))
-        
         if debug:
-            logging.info("fallback candidate: area=%d bottom_w=%d dx=%.1f depth=%.3f",
+            logging.info("Candidate: area=%.0f bottom_w=%d dx=%.1f depth=%.3f",
                          area, bottom_width, dx, avg_depth)
-        candidates.append((avg_depth, area, bottom_width, -dx, cnt))
+        candidates.append({
+            'mask': part, 'area': area,
+            'bottom_width': bottom_width, 'dx': dx, 'avg_depth': avg_depth,
+        })
 
+    candidates = [c for c in candidates
+                  if c['area'] >= 800 and c['bottom_width'] >= max(20, int(0.12 * w))]
     if not candidates:
         return None
-    # Bug 2: sort by depth first, then area, then bottom_width, then proximity to center
-    candidates.sort(key=lambda s: (s[0], s[1], s[2], s[3]), reverse=True)
-    avg_depth, area, bottom_width, _, best_cnt = candidates[0]
-    if area < 800 or bottom_width < max(20, int(0.12 * w)):
-        if debug:
-            logging.info("fallback reject best: area=%d bottom=%d", area, bottom_width)
-        return None
-    lm = np.zeros_like(mask)
-    cv2.drawContours(lm, [best_cnt], -1, 255, cv2.FILLED)
-    # Bug 7: split touching legs within the selected contour
-    parts = split_mask_on_width(lm, min_narrow_frac=0.6,
-                                min_width_px=max(20, int(0.06 * w)), debug=debug)
-    if len(parts) > 1:
-        if depth_map is not None:
-            best_part, best_d = None, -1.0
-            for part in parts:
-                ov = (part > 0) & (mask > 0)
-                d = float(depth_map[ov].mean()) if np.any(ov) else 0.0
-                if d > best_d:
-                    best_d, best_part = d, part
-            if best_part is not None:
-                lm = best_part
-        else:
-            lm = parts[0]  # largest by area
-    logging.info("Selected front leg (area=%.0f depth=%.3f)", area, avg_depth)
-    return lm
+
+    candidates.sort(key=lambda c: (c['avg_depth'], c['area']), reverse=True)
+    best = candidates[0]
+    logging.info("Selected front leg (area=%.0f depth=%.3f)", best['area'], best['avg_depth'])
+    return best['mask']
 
 
-def select_front_leg_from_keypoints(mask: np.ndarray, knee: tuple[float, float], hoof: tuple[float, float], debug: bool = False) -> np.ndarray | None:
-    """Select a leg contour that best matches the provided knee/hoof keypoints."""
+# ---------------------------------------------------------------------------
+# Leg selection — AI path (MMPose keypoints)
+# ---------------------------------------------------------------------------
+
+def select_front_leg_from_keypoints(mask: np.ndarray,
+                                    knee: tuple[float, float],
+                                    hoof: tuple[float, float],
+                                    debug: bool = False) -> np.ndarray | None:
+    """Select a leg contour that best matches provided knee/hoof keypoints.
+
+    Receives depth-filtered mask (FIX #9).
+    """
     h, w = mask.shape
-    # focus search starting slightly above the knee downwards
     start_y = max(0, int(round(knee[1])) - 40)
     zone = np.zeros_like(mask)
     zone[start_y:] = mask[start_y:]
@@ -258,27 +374,19 @@ def select_front_leg_from_keypoints(mask: np.ndarray, knee: tuple[float, float],
         return None
 
     hoof_pt = (float(hoof[0]), float(hoof[1]))
-    best_cnt = None
-    best_cnt = None
-    best_score = None
-    img_w = mask.shape[1]
+    best_cnt, best_score = None, None
     for cnt in contours:
         area = cv2.contourArea(cnt)
         if area < 200:
             continue
-        # prefer contours that contain/are near the hoof, but also near the knee x
         dist = cv2.pointPolygonTest(cnt, hoof_pt, True)
         M = cv2.moments(cnt)
         if M['m00'] != 0:
             cx = int(M['m10'] / M['m00'])
-            cy = int(M['m01'] / M['m00'])
         else:
             bx, by, bw, bh = cv2.boundingRect(cnt)
             cx = bx + bw // 2
-            cy = by + bh // 2
-        # horizontal distance from knee
         dx_knee = abs(cx - int(round(knee[0])))
-        # small penalty for being far from knee; prefer contours with positive dist (inside)
         score = (dist, -dx_knee, area)
         if debug:
             logging.info("candidate: area=%d dist=%.2f dx_knee=%d", area, dist, int(dx_knee))
@@ -292,79 +400,69 @@ def select_front_leg_from_keypoints(mask: np.ndarray, knee: tuple[float, float],
     lm = np.zeros_like(mask)
     cv2.drawContours(lm, [best_cnt], -1, 255, cv2.FILLED)
 
-    # Bug 7: use module-level split_mask_on_width instead of nested copy
     if cv2.countNonZero(lm) > (mask.shape[0] * mask.shape[1] * 0.02):
-        parts = split_mask_on_width(lm, min_narrow_frac=0.6,
-                                    min_width_px=max(20, int(0.06 * mask.shape[1])), debug=debug)
+        parts = split_mask_on_width(lm,
+                                    min_narrow_frac=0.6,
+                                    min_width_px=max(20, int(0.06 * mask.shape[1])),
+                                    debug=debug)
         if len(parts) > 1:
-            best_part, best_dist = None, None
             kx = int(round(knee[0]))
-            for part in parts:
-                ys_p, xs_p = np.where(part > 0)
-                if ys_p.size == 0:
-                    continue
-                pcx = int(np.mean(xs_p))
-                d = abs(pcx - kx)
-                if best_dist is None or d < best_dist:
-                    best_dist = d
-                    best_part = part
-            if best_part is not None:
-                lm = best_part
-    # Restrict to vertical band exactly around knee->hoof
-    ky = int(round(knee[1]))
-    hy = int(round(hoof[1]))
+            best_part = min(
+                parts,
+                key=lambda p: abs(int(np.mean(np.where(p > 0)[1])) - kx)
+                              if np.any(p > 0) else float('inf')
+            )
+            lm = best_part
+
+    ky, hy = int(round(knee[1])), int(round(hoof[1]))
     top_clip = max(0, ky - 20)
     bottom_clip = min(mask.shape[0] - 1, hy + 60)
     band = np.zeros_like(mask)
     band[top_clip: bottom_clip + 1, :] = 1
     lm = cv2.bitwise_and(lm, lm, mask=band.astype(np.uint8))
-    lm = cv2.morphologyEx(lm, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
+    lm = cv2.morphologyEx(lm, cv2.MORPH_CLOSE,
+                          cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
     lm = cv2.dilate(lm, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), iterations=1)
-    hy_clamped = min(bottom_clip, mask.shape[0] - 1)
-    xs_h = np.where(lm[hy_clamped] > 0)[0]
-    if xs_h.size == 0:
+
+    xs = np.where(lm[min(bottom_clip, mask.shape[0] - 1)] > 0)[0]
+    if xs.size == 0:
         if debug:
-            logging.info("rejecting candidate: no pixels at hoof row after clipping")
+            logging.info("rejecting candidate: no pixels at hoof row")
         return None
-    bottom_width = xs_h[-1] - xs_h[0]
-    if bottom_width < max(20, int(0.08 * mask.shape[1])):
+    if xs[-1] - xs[0] < max(20, int(0.08 * mask.shape[1])):
         if debug:
-            logging.info("rejecting candidate: bottom_width=%d too small", bottom_width)
+            logging.info("rejecting candidate: bottom too narrow")
         return None
     return lm
 
 
-def seed_watershed_from_hooves(mask: np.ndarray, hooves: list[tuple[float, float]], rgba: np.ndarray | None = None, snap_radius: int = 30) -> list:
-    """Segment `mask` into regions seeded at each hoof point using watershed.
+# ---------------------------------------------------------------------------
+# Watershed leg separator
+# ---------------------------------------------------------------------------
 
-    Returns list of uint8 masks (0/255) corresponding to each hoof seed in order.
-    """
+def seed_watershed_from_hooves(mask: np.ndarray,
+                                hooves: list[tuple[float, float]],
+                                rgba: np.ndarray | None = None,
+                                snap_radius: int = 30) -> list:
+    """Segment mask into regions seeded at each hoof point using watershed."""
     if mask is None or mask.size == 0:
         return []
     bm = (mask > 0).astype(np.uint8) * 255
-
     h, w = bm.shape
-    # helper: snap seed to nearest mask pixel
+
     def snap_to_mask(xf, yf):
-        x = int(round(xf)); y = int(round(yf))
-        if x < 0 or x >= w or y < 0 or y >= h:
-            return None
-        if bm[y, x] > 0:
+        x, y = int(round(xf)), int(round(yf))
+        if 0 <= x < w and 0 <= y < h and bm[y, x] > 0:
             return (x, y)
-        # search small neighborhood
         for r in range(1, snap_radius + 1):
-            ys = range(max(0, y - r), min(h, y + r + 1))
-            xs = range(max(0, x - r), min(w, x + r + 1))
-            best = None
-            bestd = None
-            for yy in ys:
-                for xx in xs:
+            best, bestd = None, None
+            for yy in range(max(0, y - r), min(h, y + r + 1)):
+                for xx in range(max(0, x - r), min(w, x + r + 1)):
                     if bm[yy, xx] > 0:
-                        d = (xx - x) * (xx - x) + (yy - y) * (yy - y)
+                        d = (xx - x) ** 2 + (yy - y) ** 2
                         if bestd is None or d < bestd:
-                            bestd = d
-                            best = (xx, yy)
-            if best is not None:
+                            bestd, best = d, (xx, yy)
+            if best:
                 return best
         return None
 
@@ -372,25 +470,16 @@ def seed_watershed_from_hooves(mask: np.ndarray, hooves: list[tuple[float, float
     seed_points = []
     for i, (kx, ky) in enumerate(hooves, start=1):
         s = snap_to_mask(kx, ky)
-        if s is None:
-            seed_points.append(None)
-            continue
-        sx, sy = s
-        seed_points.append((sx, sy))
-        cv2.circle(markers, (sx, sy), 6, i, -1)
+        seed_points.append(s)
+        if s:
+            cv2.circle(markers, s, 6, i, -1)
 
     if all(s is None for s in seed_points):
         return []
 
-    # build a topography for watershed. Prefer a foreground-weighted topo using
-    # the RGBA/foreground colors when available: darker/lower-contrast hair can
-    # be given higher elevation to encourage separation.
-    if rgba is not None:
-        try:
-            # rgba is RGB order from rembg
-            rgb_fg = rgba[..., :3]
-            gray = cv2.cvtColor(rgb_fg, cv2.COLOR_RGB2GRAY)
-            # invert brightness so darker pixels produce higher topo
+    try:
+        if rgba is not None:
+            gray = cv2.cvtColor(rgba[..., :3], cv2.COLOR_RGB2GRAY)
             inv = (255 - gray).astype(np.float32) / 255.0
             dist = cv2.distanceTransform((bm // 255).astype(np.uint8), cv2.DIST_L2, 5).astype(np.float32)
             if dist.max() <= 0:
@@ -398,43 +487,31 @@ def seed_watershed_from_hooves(mask: np.ndarray, hooves: list[tuple[float, float
             topo = dist * (1.0 + 0.7 * inv)
             topo8 = np.uint8((topo / topo.max()) * 255.0)
             img3 = cv2.cvtColor(topo8, cv2.COLOR_GRAY2BGR)
-            cv2.watershed(img3, markers)
-        except Exception:
-            # fallback to simple dist-based watershed
+        else:
             dist = cv2.distanceTransform((bm // 255).astype(np.uint8), cv2.DIST_L2, 5)
             if dist.max() <= 0:
                 return []
             dist8 = np.uint8((dist / dist.max()) * 255.0)
             img3 = cv2.cvtColor(dist8, cv2.COLOR_GRAY2BGR)
-            try:
-                cv2.watershed(img3, markers)
-            except Exception:
-                return []
-    else:
-        dist = cv2.distanceTransform((bm // 255).astype(np.uint8), cv2.DIST_L2, 5)
-        if dist.max() <= 0:
-            return []
-        dist8 = np.uint8((dist / dist.max()) * 255.0)
-        img3 = cv2.cvtColor(dist8, cv2.COLOR_GRAY2BGR)
-        try:
-            cv2.watershed(img3, markers)
-        except Exception:
-            return []
+        cv2.watershed(img3, markers)
+    except Exception as e:
+        logging.warning("watershed failed: %s", e)
+        return []
 
     parts = []
     for i in range(1, len(hooves) + 1):
         m = np.zeros_like(bm)
         m[markers == i] = 255
-        # remove small specks
-        if cv2.countNonZero(m) > 50:
-            parts.append(m)
-        else:
-            parts.append(None)
+        parts.append(m if cv2.countNonZero(m) > 50 else None)
     return parts
-def get_ai_leg_keypoints(inferencer, image_path: str) -> list[tuple[tuple[float, float], tuple[float, float]]]:
-    """Run MMPose (if available) to return a list of (knee, hoof) pairs for detected front legs.
-    Returns an empty list if MMPose unavailable or no confident detections.
-    """
+
+
+# ---------------------------------------------------------------------------
+# MMPose helpers
+# ---------------------------------------------------------------------------
+
+def get_ai_leg_keypoints(inferencer,
+                         image_path: str) -> list[tuple[tuple[float, float], tuple[float, float]]]:
     if inferencer is None:
         return []
     try:
@@ -443,153 +520,153 @@ def get_ai_leg_keypoints(inferencer, image_path: str) -> list[tuple[tuple[float,
         logging.warning("MMPose inference failed: %s", e)
         return []
 
-    # normalise to dict-like
     try:
-        if hasattr(res, '__iter__') and not isinstance(res, dict):
-            results = next(iter(res))
-        else:
-            results = res
+        results = next(iter(res)) if (hasattr(res, '__iter__') and not isinstance(res, dict)) else res
     except Exception:
         results = res
 
     preds = None
-    if isinstance(results, dict) and 'predictions' in results:
-        if results['predictions']:
-            preds = results['predictions'][0]
+    if isinstance(results, dict) and results.get('predictions'):
+        preds = results['predictions'][0]
     elif isinstance(results, list) and results:
         preds = results[0]
-
     if not preds:
         return []
 
-    kpts = None
-    scores = None
+    kpts, scores = None, None
     if isinstance(preds, dict):
         kpts = preds.get('keypoints') or preds.get('preds')
         scores = preds.get('keypoint_scores') or preds.get('scores')
-
     if kpts is None:
         return []
 
-    # AP-10K mapping guesses: 6=knee,7=hoof (left), 9=knee,10=hoof (right)
     legs = []
     try:
-        # convert flat arrays to (x,y) if necessary
         if isinstance(kpts, np.ndarray):
             kpts = kpts.tolist()
         if len(kpts) > 10:
-            l_knee, l_hoof = tuple(kpts[6][:2]), tuple(kpts[7][:2])
-            r_knee, r_hoof = tuple(kpts[9][:2]), tuple(kpts[10][:2])
-            # scores if available
-            s6 = float(scores[6]) if scores and len(scores) > 6 else 1.0
-            s7 = float(scores[7]) if scores and len(scores) > 7 else 1.0
-            s9 = float(scores[9]) if scores and len(scores) > 9 else 1.0
-            s10 = float(scores[10]) if scores and len(scores) > 10 else 1.0
-            if s6 > 0.12 and s7 > 0.12:
-                legs.append((l_knee, l_hoof))
-            if s9 > 0.12 and s10 > 0.12:
-                legs.append((r_knee, r_hoof))
+            def sc(i):
+                return float(scores[i]) if scores and len(scores) > i else 1.0
+            if sc(6) > 0.12 and sc(7) > 0.12:
+                legs.append((tuple(kpts[6][:2]), tuple(kpts[7][:2])))
+            if sc(9) > 0.12 and sc(10) > 0.12:
+                legs.append((tuple(kpts[9][:2]), tuple(kpts[10][:2])))
     except Exception:
         return []
-
     return legs
 
 
-def find_cannon_bone_axis(leg_mask: np.ndarray, target_knee: tuple | None = None,
-                          target_hoof: tuple | None = None) -> tuple:
-    """Estimate cannon axis via least-squares line fit through cannon-zone midpoints.
+# ---------------------------------------------------------------------------
+# FIX #8 (IMPLEMENTED) — Cannon-bone axis: strictly vertical centre line
+# ---------------------------------------------------------------------------
 
-    Bug 4 fix: returns (cx_at_pivot, axis_top_y, axis_bottom_y, pivot_y, slope)
-    where slope is dx/dy so the axis line is drawn diagonally for angled legs.
+def find_cannon_bone_axis(leg_mask: np.ndarray,
+                          target_knee: tuple[float, float] | None = None,
+                          target_hoof: tuple[float, float] | None = None
+                          ) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Return a strictly vertical centre-line axis for the cannon bone.
+
+    FIX #8 (IMPLEMENTED): Uses the median X of cannon-zone row midpoints.
+    Both pt_top and pt_bottom share the same X coordinate so the rendered
+    line is always at 90° from the ground — no diagonal slant.
+
+    FIX #10: Bottom of axis clamped to the last row with foreground pixels
+    (bottom_y), not bottom_y + 120, which pushed the line below the hoof.
     """
     h, w = leg_mask.shape
     clean = cv2.morphologyEx(leg_mask, cv2.MORPH_CLOSE,
                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
-    ys = np.where(np.any(clean > 0, axis=1))[0]
-    if ys.size == 0:
-        return w // 2, 0, h - 1, h // 2, 0.0
-    top_y = int(ys[0])
-    bottom_y = int(ys[-1])
+    ys_mask = np.where(np.any(clean > 0, axis=1))[0]
+    if ys_mask.size == 0:
+        return (w // 2, 0), (w // 2, h - 1)
+    top_y, bottom_y = int(ys_mask[0]), int(ys_mask[-1])
 
     rows = []
     for ry in range(top_y, bottom_y + 1):
         xs = np.where(clean[ry] > 0)[0]
         if xs.size >= 2:
-            lx, rx = int(xs[0]), int(xs[-1])
-            rows.append((ry, lx, rx, (lx + rx) / 2.0))
+            rows.append((ry, int(xs[0]), int(xs[-1]),
+                         (float(xs[0]) + float(xs[-1])) / 2.0,
+                         int(xs[-1] - xs[0])))
 
     if not rows:
-        return w // 2, top_y, bottom_y, (top_y + bottom_y) // 2, 0.0
+        return (w // 2, top_y), (w // 2, bottom_y)
 
-    leg_h = bottom_y - top_y + 1
+    # Define cannon zone (10%–40% of leg height, or AI-guided)
     if target_knee is not None and target_hoof is not None:
         try:
-            ai_h = int(target_hoof[1] - target_knee[1])
-            cs_y = int(target_knee[1]) + int(ai_h * 0.10)
-            ce_y = int(target_knee[1]) + int(ai_h * 0.40)
-            cannon_rows = [r for r in rows if cs_y <= r[0] <= ce_y]
+            lh = float(target_hoof[1] - target_knee[1])
+            cs = float(target_knee[1]) + lh * 0.10
+            ce = float(target_knee[1]) + lh * 0.40
+            cannon_rows = [r for r in rows if cs <= r[0] <= ce]
         except Exception:
             cannon_rows = []
     else:
-        cs_y = top_y + int(leg_h * 0.10)
-        ce_y = top_y + int(leg_h * 0.40)
-        cannon_rows = [r for r in rows if cs_y <= r[0] <= ce_y]
+        lh = bottom_y - top_y + 1
+        cs = top_y + lh * 0.10
+        ce = top_y + lh * 0.40
+        cannon_rows = [r for r in rows if cs <= r[0] <= ce]
+
     if not cannon_rows:
         cannon_rows = rows
 
-    ry_arr = np.array([r[0] for r in cannon_rows], dtype=np.float64)
-    cx_arr = np.array([r[3] for r in cannon_rows], dtype=np.float64)
-    # Bug 4 fix: fit a line (slope, intercept) through cannon midpoints
-    if len(cannon_rows) >= 2:
-        slope, intercept = np.polyfit(ry_arr, cx_arr, 1)
-    else:
-        slope = 0.0
-        intercept = float(cx_arr[0]) if len(cx_arr) > 0 else w / 2.0
-    pivot_y = int(round(float(np.mean(ry_arr))))
-    cx = int(round(slope * pivot_y + intercept))
+    fit_xs = np.array([r[3] for r in cannon_rows], dtype=np.float64)
 
-    axis_top_y = max(top_y, int(cs_y))
-    axis_bottom_y = min(h - 1, bottom_y + 120)
-    all_lx = min(r[1] for r in rows)
-    all_rx = max(r[2] for r in rows)
-    cx = int(np.clip(cx, all_lx + 1, all_rx - 1))
-    logging.info("Cannon axis: cx=%d pivot_y=%d top=%d bottom=%d slope=%.4f",
-                 cx, pivot_y, axis_top_y, axis_bottom_y, slope)
-    return cx, axis_top_y, axis_bottom_y, pivot_y, slope
+    # FIX #8: use median X — gives a strict vertical line, no diagonal slope
+    median_cx = int(round(np.median(fit_xs)))
+
+    # FIX #10: clamp bottom to actual mask extent, not +120 px past it
+    pt_top = (median_cx, top_y)
+    pt_bottom = (median_cx, bottom_y)
+
+    logging.info("Cannon axis (vertical): top=%s bottom=%s (median_cx=%d)",
+                 pt_top, pt_bottom, median_cx)
+    return pt_top, pt_bottom
 
 
-def analyze_symmetry(leg_mask: np.ndarray, center_x: int, top_y: int, bottom_y: int,
-                     slope: float = 0.0, pivot_y: int | None = None):
-    """Row-by-row symmetry with angled-axis support.
+# ---------------------------------------------------------------------------
+# Symmetry analysis with vertical centre line
+# ---------------------------------------------------------------------------
 
-    Bug 4 fix: effective center_x shifts per-row using fitted slope.
-    Returns (green_mask, red_mask, dominant_side).
+def analyze_symmetry(leg_mask: np.ndarray,
+                     pt_top: tuple[int, int],
+                     pt_bottom: tuple[int, int]):
+    """Row-by-row symmetry analysis.
+
+    With the vertical line fix (#8), cx_at(ry) always returns the same X
+    (pt_top[0] == pt_bottom[0]), making split straightforward and accurate.
     """
     h, w = leg_mask.shape
-    if pivot_y is None:
-        pivot_y = (top_y + bottom_y) // 2
     green = np.zeros((h, w), dtype=np.uint8)
     red = np.zeros((h, w), dtype=np.uint8)
 
-    total_left = 0
-    total_right = 0
-    rows = []
+    top_y, bottom_y = pt_top[1], pt_bottom[1]
+    dy = bottom_y - top_y
+
+    def cx_at(ry: int) -> int:
+        """Centre X at row ry — constant for vertical line."""
+        if dy == 0:
+            return pt_top[0]
+        t = (ry - top_y) / dy
+        return int(round(pt_top[0] + t * (pt_bottom[0] - pt_top[0])))
+
+    total_left = total_right = 0
+    row_data = []
     for ry in range(top_y, min(bottom_y + 1, h)):
-        ecx = int(round(center_x + slope * (ry - pivot_y)))
-        ecx = max(1, min(w - 2, ecx))
         xs = np.where(leg_mask[ry] > 0)[0]
         if xs.size < 2:
-            rows.append(None)
+            row_data.append(None)
             continue
         lx, rx = int(xs[0]), int(xs[-1])
-        if lx >= ecx or rx <= ecx:
-            rows.append(None)
+        cx = cx_at(ry)
+        if lx >= cx or rx <= cx:
+            row_data.append(None)
             continue
-        lw = ecx - lx
-        rw = rx - ecx
+        lw = cx - lx
+        rw = rx - cx
         total_left += lw
         total_right += rw
-        rows.append((ry, lx, rx, lw, rw, ecx))
+        row_data.append((ry, lx, rx, lw, rw, cx))
 
     if total_left > total_right * 1.02:
         dominant = "LEFT"
@@ -598,25 +675,23 @@ def analyze_symmetry(leg_mask: np.ndarray, center_x: int, top_y: int, bottom_y: 
     else:
         dominant = "SYMMETRIC"
 
-    for item in rows:
+    for item in row_data:
         if item is None:
             continue
-        ry, lx, rx, lw, rw, ecx = item
+        ry, lx, rx, lw, rw, cx = item
         sw = min(lw, rw)
         if dominant == "LEFT":
-            if ecx < rx + 1:
-                green[ry, ecx: rx + 1] = leg_mask[ry, ecx: rx + 1]
-            green[ry, max(0, ecx - sw): ecx] = leg_mask[ry, max(0, ecx - sw): ecx]
+            green[ry, cx: rx + 1] = leg_mask[ry, cx: rx + 1]
+            green[ry, max(0, cx - sw): cx] = leg_mask[ry, max(0, cx - sw): cx]
             if lw > sw:
-                es, ee = lx, max(0, ecx - sw)
+                es, ee = lx, max(0, cx - sw)
                 if es < ee:
                     red[ry, es:ee] = leg_mask[ry, es:ee]
         elif dominant == "RIGHT":
-            if lx < ecx:
-                green[ry, lx: ecx] = leg_mask[ry, lx: ecx]
-            green[ry, ecx: min(w, ecx + sw + 1)] = leg_mask[ry, ecx: min(w, ecx + sw + 1)]
+            green[ry, lx: cx] = leg_mask[ry, lx: cx]
+            green[ry, cx: min(w, cx + sw + 1)] = leg_mask[ry, cx: min(w, cx + sw + 1)]
             if rw > sw:
-                es, ee = min(w, ecx + sw + 1), rx + 1
+                es, ee = min(w, cx + sw + 1), rx + 1
                 if es < ee:
                     red[ry, es:ee] = leg_mask[ry, es:ee]
         else:
@@ -628,17 +703,21 @@ def analyze_symmetry(leg_mask: np.ndarray, center_x: int, top_y: int, bottom_y: 
     return green, red, dominant
 
 
-def apply_overlay(img: np.ndarray, green_mask: np.ndarray, red_mask: np.ndarray, alpha: float = 0.55):
+def apply_overlay(img: np.ndarray, green_mask: np.ndarray,
+                  red_mask: np.ndarray, alpha: float = 0.55) -> np.ndarray:
     res = img.astype(np.float32)
-    orig = img.astype(np.float32)
+    orig = res.copy()
     COLOR_GREEN = np.array([34, 197, 94], dtype=np.float32)
     COLOR_RED = np.array([48, 48, 220], dtype=np.float32)
-    gm = green_mask > 0
-    rm = red_mask > 0
+    gm, rm = green_mask > 0, red_mask > 0
     res[gm] = orig[gm] * (1 - alpha) + COLOR_GREEN * alpha
     res[rm] = orig[rm] * (1 - alpha) + COLOR_RED * alpha
     return np.clip(res, 0, 255).astype(np.uint8)
 
+
+# ---------------------------------------------------------------------------
+# Main processing pipeline
+# ---------------------------------------------------------------------------
 
 def process_image(path: str, do_debug: bool = False, inferencer=None) -> None:
     p = Path(path)
@@ -650,155 +729,154 @@ def process_image(path: str, do_debug: bool = False, inferencer=None) -> None:
     logging.info("Processing %s (%dx%d)", p.name, w, h)
 
     rgba, mask = extract_foreground_rgba(img)
+
+    # FIX #11: save RGBA with transparent background
+    rgba_bgra = cv2.cvtColor(np.array(rgba if isinstance(rgba, np.ndarray) else np.array(rgba)),
+                              cv2.COLOR_RGBA2BGRA)
+    cv2.imwrite(str(p.parent / f"{p.stem}_foreground.png"), rgba_bgra)
+    logging.info("Saved foreground image (RGBA with transparency).")
+
     fg_bgr = cv2.bitwise_and(img, img, mask=mask)
 
-    # 1. Save foreground image
-    cv2.imwrite(str(p.parent / f"{p.stem}_foreground.png"), fg_bgr)
-    logging.info("Saved %s_foreground.png", p.stem)
-
-    # 2. Depth estimation — Bug 1 fix: fill background with neutral gray so the
-    #    depth model isn't misled by black zeros at the masked-out region.
-    depth_input = img.copy()
-    depth_input[mask == 0] = 128
-    depth_map = estimate_depth(depth_input)
+    # FIX #1: pass mask so background gets neutral-gray fill, not black zeros
+    depth_map = estimate_depth(fg_bgr, fg_mask=mask)
     depth_color = cv2.applyColorMap((depth_map * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
     cv2.imwrite(str(p.parent / f"{p.stem}_depth.png"), depth_color)
-    logging.info("Saved %s_depth.png", p.stem)
+    logging.info("Saved depth map.")
 
-    # 3 & 4. Select front leg using depth + AI or depth-aware fallback
+    # FIX #9 / #12: apply depth prefilter — removes back-leg pixels so leg
+    # selection only sees the frontmost leg.  percentile=25 is conservative
+    # enough to keep the full cannon bone even in ground-level shots while
+    # still stripping the clearly-far back leg (blue in TURBO).
+    # The height-safety guard (FIX #13) returns the original if the top of
+    # the leg is accidentally cut off.
+    depth_mask = depth_prefilter_mask(mask, depth_map, percentile=25.0)
+    if do_debug:
+        cv2.imwrite(str(p.parent / f"{p.stem}_depth_mask.png"), depth_mask)
+        logging.info("Saved depth-filtered mask (debug).")
+
+    leg_masks = []
     leg_infos = []
+
+    # --- AI path ---
     if inferencer is not None:
         try:
             legs = get_ai_leg_keypoints(inferencer, str(p))
         except Exception:
             legs = []
         if legs:
-            # Bug 6 fix: use watershed to separate touching legs when >= 2 detected
-            if len(legs) >= 2:
-                hooves = [hoof for (_, hoof) in legs]
-                ws_parts = seed_watershed_from_hooves(mask, hooves, rgba=rgba)
-            else:
-                ws_parts = []
+            best_leg, best_depth_val = None, -1.0
+            for knee, hoof in legs:
+                line_mask = np.zeros((h, w), dtype=np.uint8)
+                cv2.line(line_mask,
+                         (int(knee[0]), int(knee[1])),
+                         (int(hoof[0]), int(hoof[1])), 255, thickness=5)
+                overlap = (line_mask > 0) & (mask > 0)
+                avg_d = float(depth_map[overlap].mean()) if np.any(overlap) else 0.0
+                logging.info("Leg candidate knee=(%.1f,%.1f) hoof=(%.1f,%.1f) depth=%.3f",
+                             *knee, *hoof, avg_d)
+                if avg_d > best_depth_val:
+                    best_depth_val, best_leg = avg_d, (knee, hoof)
 
-            if ws_parts and any(pt is not None for pt in ws_parts):
-                # Score each watershed segment by avg depth; pick the frontmost
-                best_leg, best_d = None, -1.0
-                for (knee, hoof), part in zip(legs, ws_parts):
-                    if part is None:
-                        continue
-                    ov = (part > 0) & (mask > 0)
-                    d = float(depth_map[ov].mean()) if np.any(ov) else 0.0
-                    logging.info("Watershed leg (%.0f,%.0f)->(%.0f,%.0f) depth=%.3f",
-                                 knee[0], knee[1], hoof[0], hoof[1], d)
-                    if d > best_d:
-                        best_d, best_leg = d, (knee, hoof, part)
-                if best_leg is not None:
-                    knee, hoof, lm = best_leg
+            if best_leg is not None:
+                knee, hoof = best_leg
+                # FIX #9: use depth_mask instead of raw mask
+                lm = select_front_leg_from_keypoints(depth_mask, knee, hoof, debug=do_debug)
+                if lm is not None:
+                    leg_masks.append(lm)
                     leg_infos.append({'mask': lm, 'knee': knee, 'hoof': hoof})
-            else:
-                # Score each keypoint pair by depth along knee->hoof segment
-                best_leg, best_d = None, -1.0
-                for knee, hoof in legs:
-                    lm_line = np.zeros((h, w), dtype=np.uint8)
-                    cv2.line(lm_line, (int(knee[0]), int(knee[1])),
-                             (int(hoof[0]), int(hoof[1])), 255, 5)
-                    ov = (lm_line > 0) & (mask > 0)
-                    d = float(depth_map[ov].mean()) if np.any(ov) else 0.0
-                    logging.info("Leg (%.0f,%.0f)->(%.0f,%.0f) avg depth=%.3f",
-                                 knee[0], knee[1], hoof[0], hoof[1], d)
-                    if d > best_d:
-                        best_d, best_leg = d, (knee, hoof)
-                if best_leg is not None:
-                    knee, hoof = best_leg
-                    lm = select_front_leg_from_keypoints(mask, knee, hoof, debug=do_debug)
-                    if lm is not None:
-                        leg_infos.append({'mask': lm, 'knee': knee, 'hoof': hoof})
+                    cv2.imwrite(str(p.parent / f"{p.stem}_isolated_leg.png"), lm)
+                    logging.info("Saved isolated leg (AI path).")
 
-    # Bug 2 fix: fallback now receives depth_map for depth-based scoring
-    if not leg_infos:
-        logging.warning("AI path produced no leg; using depth-aware fallback.")
-        lm = select_front_leg_fallback(mask, depth_map=depth_map, debug=do_debug)
+    # --- Fallback path ---
+    if not leg_masks:
+        logging.warning("AI keypoints missing or failed — using fallback leg selection.")
+        # FIX #9: use depth_mask so back-leg pixels are excluded from selection
+        lm = select_front_leg_fallback(depth_mask, depth_map=depth_map, debug=do_debug)
         if lm is None:
             logging.warning("No front leg found for %s", p.name)
             cv2.imwrite(str(p.parent / f"{p.stem}_analyzed.jpg"), img)
             return
-        leg_infos = [{'mask': lm, 'knee': (int(w / 2), 0), 'hoof': (int(w / 2), int(h - 1))}]
+        leg_masks = [lm]
+        leg_infos = [{'mask': lm, 'knee': (w / 2.0, 0.0), 'hoof': (w / 2.0, float(h - 1))}]
+        cv2.imwrite(str(p.parent / f"{p.stem}_isolated_leg.png"), lm)
+        logging.info("Saved isolated leg (fallback path).")
 
-    # 4. Save isolated leg
-    cv2.imwrite(str(p.parent / f"{p.stem}_isolated_leg.png"), leg_infos[0]['mask'])
-    logging.info("Saved %s_isolated_leg.png", p.stem)
-
-    # 5. Symmetry analysis
-    h, w = img.shape[:2]
+    # --- Symmetry analysis ---
     combined_green = np.zeros((h, w), dtype=np.uint8)
     combined_red = np.zeros((h, w), dtype=np.uint8)
-    draw_info = []  # Bug 5 fix: store per-leg draw data instead of relying on loop vars
+
+    # FIX #5: accumulate per-leg draw info in a list
+    per_leg_draw: list[dict] = []
 
     for info in leg_infos:
-        leg_mask_i = info['mask']
-        cx, ty, by, piv_y, slope = find_cannon_bone_axis(leg_mask_i)
-        green, red, dominant = analyze_symmetry(leg_mask_i, cx, ty, by,
-                                                slope=slope, pivot_y=piv_y)
+        pt_top, pt_bottom = find_cannon_bone_axis(
+            info['mask'],
+            target_knee=info.get('knee'),
+            target_hoof=info.get('hoof'),
+        )
+        green, red, dominant = analyze_symmetry(info['mask'], pt_top, pt_bottom)
         combined_green = np.maximum(combined_green, green)
         combined_red = np.maximum(combined_red, red)
-        draw_info.append((cx, ty, by, piv_y, slope, dominant))
+        per_leg_draw.append({'pt_top': pt_top, 'pt_bottom': pt_bottom, 'dominant': dominant})
 
     out = apply_overlay(img, combined_green, combined_red, alpha=0.55)
-    thickness = max(2, int(w * 0.004))
 
-    # Bug 5 fix: render each leg's axis and label independently
-    for i, (cx, ty, by, piv_y, slope, dominant) in enumerate(draw_info):
-        x_top = int(round(cx + slope * (ty - piv_y)))
-        x_bot = int(round(cx + slope * (by - piv_y)))
-        cv2.line(out, (x_top, ty), (x_bot, by), (255, 80, 0), thickness)
-        cv2.putText(out, f"Leg {i + 1} Dominant: {dominant}",
-                    (10, 30 + i * 35), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8, (0, 0, 255), 2, cv2.LINE_AA)
+    # FIX #5: draw every leg's axis and label
+    for i, di in enumerate(per_leg_draw):
+        cv2.line(out, di['pt_top'], di['pt_bottom'], (255, 80, 0), max(2, int(w * 0.004)))
+        cv2.putText(out, f"Leg {i + 1} Dominant: {di['dominant']}",
+                    (10, 30 + i * 32), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
     cv2.imwrite(str(p.parent / f"{p.stem}_analyzed.jpg"), out)
+
     if do_debug:
         dbg = img.copy()
         dbg[combined_green > 0] = [34, 197, 94]
         dbg[combined_red > 0] = [48, 48, 220]
-        for cx, ty, by, piv_y, slope, _ in draw_info:
-            x_top = int(round(cx + slope * (ty - piv_y)))
-            x_bot = int(round(cx + slope * (by - piv_y)))
-            cv2.line(dbg, (x_top, ty), (x_bot, by), (255, 80, 0), thickness)
+        for di in per_leg_draw:
+            cv2.line(dbg, di['pt_top'], di['pt_bottom'], (255, 80, 0), max(2, int(w * 0.004)))
         cv2.imwrite(str(p.parent / f"{p.stem}_debug.png"), dbg)
+
     logging.info("Saved %s_analyzed.jpg", p.stem)
 
 
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
 def main():
-    parser = argparse.ArgumentParser(description="Minimal leg symmetry analyzer")
+    parser = argparse.ArgumentParser(description="Horse leg symmetry analyzer (fixed v2)")
     parser.add_argument("images", nargs="+", help="Image files or glob patterns")
     parser.add_argument("--debug", action="store_true", help="Save intermediate debug images")
-    parser.add_argument("--use-ai", action="store_true", help="Enable MMPose AI keypoint detection if available")
-    parser.add_argument("--model-path", type=str, default=None, help="Optional local model path for MMPoseInferencer")
-    parser.add_argument("--device", type=str, default=None, help="Device for MMPose (e.g., cpu or cuda:0)")
+    parser.add_argument("--use-ai", action="store_true",
+                        help="Enable MMPose AI keypoint detection if available")
+    parser.add_argument("--model-path", type=str, default=None,
+                        help="Optional local model path for MMPoseInferencer")
+    parser.add_argument("--device", type=str, default=None,
+                        help="Device for MMPose (e.g. cpu or cuda:0)")
     args = parser.parse_args()
 
     inputs = sorted(set(f for pat in args.images for f in glob.glob(pat)))
     if not inputs:
-        logging.error("No input images")
+        logging.error("No input images found.")
         sys.exit(1)
 
     inferencer = None
     if args.use_ai and MMPoseInferencer is not None:
         try:
-            if args.model_path:
-                inferencer = MMPoseInferencer(pose2d=args.model_path, device=args.device) if args.device else MMPoseInferencer(pose2d=args.model_path)
-            else:
-                inferencer = MMPoseInferencer(pose2d='rtmpose-m_8xb64-210e_ap10k-256x256')
-            logging.info("MMPose inferencer initialized")
+            kwargs = {"device": args.device} if args.device else {}
+            pose = args.model_path or 'rtmpose-m_8xb64-210e_ap10k-256x256'
+            inferencer = MMPoseInferencer(pose2d=pose, **kwargs)
+            logging.info("MMPose inferencer initialized.")
         except Exception as e:
             logging.warning("Failed to initialize MMPoseInferencer: %s", e)
-            inferencer = None
 
-    for img in inputs:
+    for img_path in inputs:
         try:
-            process_image(img, do_debug=args.debug, inferencer=inferencer)
+            process_image(img_path, do_debug=args.debug, inferencer=inferencer)
         except Exception as e:
-            logging.exception("Failed processing %s: %s", img, e)
+            logging.exception("Failed processing %s: %s", img_path, e)
 
 
 if __name__ == "__main__":

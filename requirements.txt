@@ -1,0 +1,10 @@
+opencv-python
+numpy
+Pillow
+rembg
+transformers
+torch
+torchvision
+mmpose
+mmengine
+mmdet

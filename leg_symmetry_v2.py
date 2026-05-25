@@ -220,6 +220,25 @@ def depth_prefilter_mask(mask: np.ndarray,
     return filtered
 
 
+def trim_upper_leg_fraction(leg_mask: np.ndarray, exclude_top_frac: float = 0.05) -> np.ndarray:
+    """Remove the top fraction of a selected leg mask before analysis."""
+    if leg_mask is None or leg_mask.size == 0:
+        return leg_mask
+
+    ys = np.where(np.any(leg_mask > 0, axis=1))[0]
+    if ys.size == 0:
+        return leg_mask.copy()
+
+    top_y, bottom_y = int(ys[0]), int(ys[-1])
+    leg_h = bottom_y - top_y + 1
+    cut_y = top_y + int(round(leg_h * exclude_top_frac))
+    cut_y = min(max(top_y, cut_y), bottom_y + 1)
+
+    trimmed = leg_mask.copy()
+    trimmed[top_y:cut_y, :] = 0
+    return trimmed
+
+
 # ---------------------------------------------------------------------------
 # FIX #3 — tail rejection helper
 # ---------------------------------------------------------------------------
@@ -784,6 +803,7 @@ def process_image(path: str, do_debug: bool = False, inferencer=None) -> None:
                 # FIX #9: use depth_mask instead of raw mask
                 lm = select_front_leg_from_keypoints(depth_mask, knee, hoof, debug=do_debug)
                 if lm is not None:
+                    lm = trim_upper_leg_fraction(lm, 0.05)
                     leg_masks.append(lm)
                     leg_infos.append({'mask': lm, 'knee': knee, 'hoof': hoof})
                     cv2.imwrite(str(p.parent / f"{p.stem}_isolated_leg.png"), lm)
@@ -798,6 +818,7 @@ def process_image(path: str, do_debug: bool = False, inferencer=None) -> None:
             logging.warning("No front leg found for %s", p.name)
             cv2.imwrite(str(p.parent / f"{p.stem}_analyzed.jpg"), img)
             return
+        lm = trim_upper_leg_fraction(lm, 0.20)
         leg_masks = [lm]
         leg_infos = [{'mask': lm, 'knee': (w / 2.0, 0.0), 'hoof': (w / 2.0, float(h - 1))}]
         cv2.imwrite(str(p.parent / f"{p.stem}_isolated_leg.png"), lm)

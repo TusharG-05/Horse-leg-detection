@@ -10,12 +10,18 @@ from PIL import Image as PILImage
 from rembg import remove
 from transformers import pipeline as hf_pipeline
 from mmpose.apis import MMPoseInferencer
+try:
+    import torch
+    _HAS_TORCH = True
+except Exception:
+    _HAS_TORCH = False
 
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
 _DEPTH_MODEL_ID = "depth-anything/Depth-Anything-V2-Small-hf"
 _depth_pipe = None
+_DEPTH_PIPE_DEVICE = -1  # -1 => CPU, 0 => first CUDA device (HF pipeline uses int)
 
 
 # ---------------------------------------------------------------------------
@@ -26,14 +32,54 @@ def get_depth_pipe():
     global _depth_pipe
     if _depth_pipe is None:
         logging.info("Loading Depth Anything V2 Small …")
-        _depth_pipe = hf_pipeline("depth-estimation", model=_DEPTH_MODEL_ID, device=-1)
+        # Use the chosen runtime device (set by select_runtime_device)
+        _depth_pipe = hf_pipeline("depth-estimation", model=_DEPTH_MODEL_ID, device=_DEPTH_PIPE_DEVICE)
         logging.info("Depth Anything V2 ready.")
     return _depth_pipe
 
 
+def select_runtime_device(device_arg: str | None = None) -> str:
+    """Choose runtime devices for HF pipeline and MMPose.
+
+    Returns the device string suitable for MMPoseInferencer (e.g. 'cpu' or 'cuda:0').
+    Also sets global _DEPTH_PIPE_DEVICE used by the HF depth pipeline.
+    """
+    global _DEPTH_PIPE_DEVICE
+    mmpose_device = None
+    has_cuda = False
+    if device_arg:
+        # user-specified device takes precedence
+        da = device_arg.strip().lower()
+        if da.startswith('cuda') or 'cuda' in da:
+            _DEPTH_PIPE_DEVICE = 0
+            mmpose_device = device_arg
+        elif da == 'cpu':
+            _DEPTH_PIPE_DEVICE = -1
+            mmpose_device = 'cpu'
+        else:
+            # fall back to cpu
+            _DEPTH_PIPE_DEVICE = -1
+            mmpose_device = device_arg
+    else:
+        # auto-detect
+        try:
+            has_cuda = bool(_HAS_TORCH and torch.cuda.is_available())
+        except Exception:
+            has_cuda = False
+        if has_cuda:
+            _DEPTH_PIPE_DEVICE = 0
+            mmpose_device = 'cuda:0'
+        else:
+            _DEPTH_PIPE_DEVICE = -1
+            mmpose_device = 'cpu'
+
+    logging.info("Selected runtime devices: HF device=%s, MMPose device=%s", _DEPTH_PIPE_DEVICE, mmpose_device)
+    return mmpose_device
+
+
 def estimate_depth(image_bgr: np.ndarray,
                    fg_mask: np.ndarray | None = None) -> np.ndarray:
-    """Depth Anything V2 → float32 depth map [0, 1].  1.0 = closest.
+    """Depth Anything V2 -> float32 depth map [0, 1].  1.0 = closest.
 
     FIX #1: Background pixels are filled with neutral gray (127) before
     inference so the model is not confused by black zeros.  After inference,
@@ -89,8 +135,16 @@ def extract_foreground_rgba(image_bgr: np.ndarray) -> tuple:
     return rgba, mask.astype(np.uint8)
 
 
+def create_blue_background_preview(image_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Return a preview image with the removed background filled blue."""
+    blue_bg = np.full_like(image_bgr, (255, 0, 0))
+    preview = blue_bg.copy()
+    preview[mask > 0] = image_bgr[mask > 0]
+    return preview
+
+
 # ---------------------------------------------------------------------------
-# FIX #7 — split_mask_on_width (module level)
+# FIX #7 - split_mask_on_width (module level)
 # ---------------------------------------------------------------------------
 
 def split_mask_on_width(mask_region: np.ndarray,
@@ -153,7 +207,7 @@ def split_mask_on_width(mask_region: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
-# FIX #9 (ACTIVATED) — depth-based foreground prefilter
+# FIX #9 (ACTIVATED) - depth-based foreground prefilter
 # ---------------------------------------------------------------------------
 
 def depth_prefilter_mask(mask: np.ndarray,
@@ -165,14 +219,14 @@ def depth_prefilter_mask(mask: np.ndarray,
     depths.  In front-on shots this drops the back leg (blue in TURBO) while
     keeping the front leg (orange/red).
 
-    FIX #12 — percentile lowered from 50 → 25.
+    FIX #12 - percentile lowered from 50 -> 25.
     When the camera is at ground level pointing upward the hoof is the closest
-    point (depth ≈ 1.0) while the cannon bone is further away (depth ≈ 0.4–0.6).
+    point (depth approx 1.0) while the cannon bone is further away (depth approx 0.4-0.6).
     A 50th-percentile threshold sits exactly at the hoof/cannon-bone boundary,
     stripping the cannon bone entirely.  25th-percentile keeps the vast majority
     of the front leg while still discarding the clearly-far back leg pixels.
 
-    FIX #13 — height-preservation safety guard.
+    FIX #13 - height-preservation safety guard.
     The existing pixel-count guard (< 15 %) does not catch the case where the
     top of the leg is cut off (cannon bone has low pixel count relative to the
     wide hoof).  An additional check compares the bounding-box HEIGHT of the
@@ -198,7 +252,7 @@ def depth_prefilter_mask(mask: np.ndarray,
 
     # Safety guard 1: pixel count (original)
     if cv2.countNonZero(filtered) < cv2.countNonZero(mask) * 0.15:
-        logging.warning("depth_prefilter_mask: pixel count too small — returning original mask.")
+        logging.warning("depth_prefilter_mask: pixel count too small - returning original mask.")
         return mask
 
     # Safety guard 2 (FIX #13): height preservation
@@ -211,7 +265,7 @@ def depth_prefilter_mask(mask: np.ndarray,
             if filt_height < orig_height * 0.65:
                 logging.warning(
                     "depth_prefilter_mask: height shrank to %.0f%% (orig=%d filt=%d) "
-                    "— top of leg cut off; returning original mask.",
+                    "- top of leg cut off; returning original mask.",
                     100.0 * filt_height / orig_height, orig_height, filt_height)
                 return mask
 
@@ -239,8 +293,233 @@ def trim_upper_leg_fraction(leg_mask: np.ndarray, exclude_top_frac: float = 0.05
     return trimmed
 
 
+def keep_closest_component(mask: np.ndarray, depth_map: np.ndarray,
+                           min_area_frac: float = 0.005,
+                           debug: bool = False) -> np.ndarray:
+    """From a binary mask, keep only the connected component with the
+    largest mean depth (i.e. closest). This removes background legs when
+    depth prefilter still left multiple blobs."""
+    if mask is None or mask.size == 0:
+        return mask
+    bm = (mask > 0).astype(np.uint8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(bm, 8)
+    if num <= 2:
+        return mask
+
+    total_area = cv2.countNonZero(mask)
+    best_lab = None
+    best_score = -1.0
+    for lab in range(1, num):
+        area = int(stats[lab, cv2.CC_STAT_AREA])
+        if area < max(10, int(total_area * min_area_frac)):
+            continue
+        comp_mask = (labels == lab)
+        depths = depth_map[comp_mask]
+        if depths.size == 0:
+            continue
+        mean_depth = float(np.mean(depths))
+        score = mean_depth + 1e-6 * float(area)
+        if score > best_score:
+            best_score = score
+            best_lab = lab
+
+    if best_lab is None:
+        return mask
+
+    out = np.zeros_like(mask)
+    out[labels == best_lab] = 255
+    if debug:
+        logging.info("keep_closest_component: kept lab=%d area=%d", best_lab, int(stats[best_lab, cv2.CC_STAT_AREA]))
+    return out
+
+
+def depth_pixel_gate(mask: np.ndarray,
+                     depth_map: np.ndarray,
+                     depth_delta_start: float = 0.35,
+                     min_keep_frac: float = 0.08,
+                     min_height_frac: float = 0.6,
+                     debug: bool = False) -> np.ndarray:
+    """Tighter pixel-level gating using depth values.
+
+    Starts with a conservative depth_delta (closer-only) and relaxes it
+    until a minimum fraction of foreground pixels are kept. Ensures the
+    vertical height of the filtered mask is not drastically reduced.
+    Returns a binary mask (0/255).
+    """
+    if mask is None or mask.size == 0:
+        return mask
+
+    orig_count = cv2.countNonZero(mask)
+    if orig_count == 0:
+        return mask
+
+    ys_orig = np.where(np.any(mask > 0, axis=1))[0]
+    orig_height = int(ys_orig[-1] - ys_orig[0]) if ys_orig.size >= 2 else 0
+
+    depth_delta = float(depth_delta_start)
+    filtered = None
+    # try relaxing depth_delta down to a reasonable minimum
+    while depth_delta >= 0.10:
+        farthest = float(depth_map[mask > 0].min())
+        thresh = farthest + depth_delta
+        candidate = np.zeros_like(mask)
+        candidate[(mask > 0) & (depth_map >= thresh)] = 255
+        # close small holes
+        candidate = cv2.morphologyEx(candidate, cv2.MORPH_CLOSE,
+                                     cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
+        keep_count = cv2.countNonZero(candidate)
+        if keep_count >= max(10, int(orig_count * min_keep_frac)):
+            # height safety
+            ys_f = np.where(np.any(candidate > 0, axis=1))[0]
+            if ys_f.size >= 2:
+                filt_height = int(ys_f[-1] - ys_f[0])
+                if orig_height > 0 and filt_height < orig_height * min_height_frac:
+                    if debug:
+                        logging.info("depth_pixel_gate: height shrank %.1f%% at delta=%.2f",
+                                     100.0 * filt_height / orig_height, depth_delta)
+                    # relax threshold (reduce depth_delta) and continue
+                    depth_delta -= 0.05
+                    continue
+            filtered = candidate
+            break
+        depth_delta -= 0.05
+
+    if filtered is None:
+        # fallback: use a lenient threshold so we don't return empty mask
+        farthest = float(depth_map[mask > 0].min())
+        thresh = farthest + max(0.10, depth_delta_start - 0.15)
+        filtered = np.zeros_like(mask)
+        filtered[(mask > 0) & (depth_map >= thresh)] = 255
+        filtered = cv2.morphologyEx(filtered, cv2.MORPH_CLOSE,
+                                     cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
+
+    # Remove very small components and keep only components that reach low
+    # rows (hoof area). If multiple remain, prefer the one with highest mean depth.
+    num, labels, stats, _ = cv2.connectedComponentsWithStats((filtered > 0).astype(np.uint8), 8)
+    if num <= 2:
+        return filtered
+
+    h, w = mask.shape
+    bottom_threshold = int(h * 0.6)
+    best_lab = None
+    best_mean = -1.0
+    total_area = cv2.countNonZero(filtered)
+    for lab in range(1, num):
+        area = int(stats[lab, cv2.CC_STAT_AREA])
+        if area < max(20, int(total_area * 0.01)):
+            continue
+        comp_mask = (labels == lab)
+        rows = np.where(np.any(comp_mask, axis=1))[0]
+        if rows.size == 0:
+            continue
+        # prefer components that reach lower parts of image and are closer
+        reaches_bottom = rows[-1] >= bottom_threshold
+        mean_depth = float(depth_map[comp_mask].mean()) if np.any(comp_mask) else -1.0
+        score = mean_depth + (0.001 * float(area)) + (0.05 if reaches_bottom else 0.0)
+        if score > best_mean:
+            best_mean = score
+            best_lab = lab
+
+    if best_lab is not None:
+        out = np.zeros_like(mask)
+        out[labels == best_lab] = 255
+        if debug:
+            logging.info("depth_pixel_gate: selected lab=%d area=%d", best_lab, int(stats[best_lab, cv2.CC_STAT_AREA]))
+        return out
+
+    return filtered
+
+
+def side_carve_by_row(mask: np.ndarray, depth_map: np.ndarray, min_width_frac: float = 0.45,
+                      debug: bool = False) -> np.ndarray:
+    """Row-wise carve: for wide connected blobs, pick the closer side per-row.
+
+    Returns a refined mask (0/255)."""
+    if mask is None or mask.size == 0:
+        return mask
+    h, w = mask.shape
+    xs = np.where(np.any(mask > 0, axis=0))[0]
+    if xs.size < 2:
+        return mask
+    bbox_w = xs[-1] - xs[0]
+    if bbox_w < int(min_width_frac * w):
+        return mask
+
+    carved = np.zeros_like(mask)
+    ys = np.where(np.any(mask > 0, axis=1))[0]
+    if ys.size == 0:
+        return mask
+    for y in range(ys[0], ys[-1] + 1):
+        row_xs = np.where(mask[y] > 0)[0]
+        if row_xs.size < 2:
+            continue
+        mid = int(round((row_xs[0] + row_xs[-1]) / 2.0))
+        left = row_xs[row_xs < mid]
+        right = row_xs[row_xs >= mid]
+        if left.size == 0 or right.size == 0:
+            continue
+        left_d = float(depth_map[y, left].mean())
+        right_d = float(depth_map[y, right].mean())
+        if left_d >= right_d:
+            carved[y, left] = 255
+        else:
+            carved[y, right] = 255
+
+    carved = cv2.morphologyEx(carved, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
+    carved = cv2.dilate(carved, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), iterations=1)
+
+    # If carved is too small, return original
+    if cv2.countNonZero(carved) < cv2.countNonZero(mask) * 0.25:
+        if debug:
+            logging.info("side_carve_by_row: carved too small; aborting")
+        return mask
+
+    # choose the largest connected component from carved
+    num, labels, stats, _ = cv2.connectedComponentsWithStats((carved > 0).astype(np.uint8), 8)
+    if num <= 1:
+        return mask
+    best_lab = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    out = np.zeros_like(mask)
+    out[labels == best_lab] = 255
+    if debug:
+        logging.info("side_carve_by_row: kept lab=%d area=%d", best_lab, int(stats[best_lab, cv2.CC_STAT_AREA]))
+    return out
+
+
+def find_hoof_seeds_from_depth(mask: np.ndarray, depth_map: np.ndarray,
+                               bottom_frac: float = 0.25,
+                               num_seeds: int = 2,
+                               min_sep_px: int = 40) -> list:
+    """Find hoof seed points by selecting the deepest pixels in the lower
+    band of the mask. Returns list of (x,y) tuples for seeding watershed."""
+    if mask is None or mask.size == 0:
+        return []
+    h, w = mask.shape
+    ys = np.where(np.any(mask > 0, axis=1))[0]
+    if ys.size == 0:
+        return []
+    bottom = ys[-1]
+    band_h = max(10, int(h * bottom_frac))
+    y0 = max(0, bottom - band_h)
+    candidates = np.where(mask[y0:bottom + 1] > 0)
+    if candidates[0].size == 0:
+        return []
+    rows = candidates[0] + y0
+    cols = candidates[1]
+    vals = depth_map[rows, cols]
+    idxs = np.argsort(vals)[::-1]
+    seeds = []
+    for i in idxs:
+        x, y = int(cols[i]), int(rows[i])
+        if all(abs(x - sx) >= min_sep_px for sx, sy in seeds):
+            seeds.append((float(x), float(y)))
+        if len(seeds) >= num_seeds:
+            break
+    return seeds
+
+
 # ---------------------------------------------------------------------------
-# FIX #3 — tail rejection helper
+# FIX #3 - tail rejection helper
 # ---------------------------------------------------------------------------
 
 def is_likely_tail(contour: np.ndarray, mask: np.ndarray) -> bool:
@@ -276,7 +555,7 @@ def is_likely_tail(contour: np.ndarray, mask: np.ndarray) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Leg selection — fallback (no MMPose)
+# Leg selection - fallback (no MMPose)
 # ---------------------------------------------------------------------------
 
 def select_front_leg_fallback(mask: np.ndarray,
@@ -289,7 +568,7 @@ def select_front_leg_fallback(mask: np.ndarray,
     """
     h, w = mask.shape
     zone = np.zeros_like(mask)
-    # FIX #14: zone cutoff lowered from 35% → 20% of image height.
+    # FIX #14: zone cutoff lowered from 35% -> 20% of image height.
     # At 35% the cannon bone (which starts at ~20-30% from the top in
     # ground-level shots) was sometimes excluded from the candidate region.
     zone[int(h * 0.20):] = mask[int(h * 0.20):]
@@ -374,7 +653,7 @@ def select_front_leg_fallback(mask: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
-# Leg selection — AI path (MMPose keypoints)
+# Leg selection - AI path (MMPose keypoints)
 # ---------------------------------------------------------------------------
 
 def select_front_leg_from_keypoints(mask: np.ndarray,
@@ -577,7 +856,7 @@ def get_ai_leg_keypoints(inferencer,
 
 
 # ---------------------------------------------------------------------------
-# FIX #8 (IMPLEMENTED) — Cannon-bone axis: strictly vertical centre line
+# FIX #8 (IMPLEMENTED) - Cannon-bone axis: strictly vertical centre line
 # ---------------------------------------------------------------------------
 
 def find_cannon_bone_axis(leg_mask: np.ndarray,
@@ -588,7 +867,7 @@ def find_cannon_bone_axis(leg_mask: np.ndarray,
 
     FIX #8 (IMPLEMENTED): Uses the median X of cannon-zone row midpoints.
     Both pt_top and pt_bottom share the same X coordinate so the rendered
-    line is always at 90° from the ground — no diagonal slant.
+    line is always vertical (90 degrees from the ground) - no diagonal slant.
 
     FIX #10: Bottom of axis clamped to the last row with foreground pixels
     (bottom_y), not bottom_y + 120, which pushed the line below the hoof.
@@ -612,7 +891,7 @@ def find_cannon_bone_axis(leg_mask: np.ndarray,
     if not rows:
         return (w // 2, top_y), (w // 2, bottom_y)
 
-    # Define cannon zone (10%–40% of leg height, or AI-guided)
+    # Define cannon zone (10%-40% of leg height, or AI-guided)
     if target_knee is not None and target_hoof is not None:
         try:
             lh = float(target_hoof[1] - target_knee[1])
@@ -632,7 +911,7 @@ def find_cannon_bone_axis(leg_mask: np.ndarray,
 
     fit_xs = np.array([r[3] for r in cannon_rows], dtype=np.float64)
 
-    # FIX #8: use median X — gives a strict vertical line, no diagonal slope
+    # FIX #8: use median X - gives a strict vertical line, no diagonal slope
     median_cx = int(round(np.median(fit_xs)))
 
     # FIX #10: clamp bottom to actual mask extent, not +120 px past it
@@ -664,7 +943,7 @@ def analyze_symmetry(leg_mask: np.ndarray,
     dy = bottom_y - top_y
 
     def cx_at(ry: int) -> int:
-        """Centre X at row ry — constant for vertical line."""
+        # Centre X at row ry - constant for vertical line.
         if dy == 0:
             return pt_top[0]
         t = (ry - top_y) / dy
@@ -739,7 +1018,7 @@ def apply_overlay(img: np.ndarray, green_mask: np.ndarray,
 # Main processing pipeline
 # ---------------------------------------------------------------------------
 
-def process_image(path: str, do_debug: bool = False, inferencer=None) -> None:
+def process_image(path: str, do_debug: bool = False, do_preprocess: bool = False, inferencer=None) -> None:
     p = Path(path)
     img = cv2.imread(str(p))
     if img is None:
@@ -758,13 +1037,47 @@ def process_image(path: str, do_debug: bool = False, inferencer=None) -> None:
 
     fg_bgr = cv2.bitwise_and(img, img, mask=mask)
 
-    # FIX #1: pass mask so background gets neutral-gray fill, not black zeros
-    depth_map = estimate_depth(fg_bgr, fg_mask=mask)
+    # Create and save a blue-matted preview for visual inspection. Do NOT
+    # overwrite the original image - this preview is only used for analysis.
+    blue_preview = create_blue_background_preview(img, mask)
+    cv2.imwrite(str(p.parent / f"{p.stem}_bluebg.png"), blue_preview)
+    logging.info("Saved blue-background preview.")
+
+    if do_preprocess:
+        # Prepare an enhanced copy for depth estimation so the depth model isn't
+        # confused by very dark/black legs or monotone backgrounds.
+        # We apply global contrast and brightness scaling, then boost saturation.
+        # Global adjustments are safer than CLAHE for depth models.
+        try:
+            # 1. Global contrast (alpha) and brightness (beta) boost
+            adjusted = cv2.convertScaleAbs(blue_preview, alpha=1.35, beta=25)
+
+            # 2. Saturation boost
+            hsv = cv2.cvtColor(adjusted, cv2.COLOR_BGR2HSV).astype(np.float32)
+            hsv[:, :, 1] = np.clip(hsv[:, :, 1] * 1.35, 0, 255)
+            blue_for_depth = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+        except Exception as e:
+            logging.warning("Preprocessing failed: %s", e)
+            blue_for_depth = blue_preview.copy()
+    else:
+        # Prepare a slightly saturation-boosted copy for depth estimation so the
+        # depth model isn't confused by very dark legs or monotone backgrounds.
+        try:
+            hsv = cv2.cvtColor(blue_preview, cv2.COLOR_BGR2HSV).astype(np.float32)
+            hsv[:, :, 1] = np.clip(hsv[:, :, 1] * 1.15, 0, 255)
+            blue_for_depth = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+        except Exception:
+            blue_for_depth = blue_preview.copy()
+
+    # Run depth estimation on the blue-matted (and slightly saturated) image.
+    # Pass the foreground mask so background pixels are neutralized inside the
+    # estimator, and depth values outside the mask are zeroed afterwards.
+    depth_map = estimate_depth(blue_for_depth, fg_mask=mask)
     depth_color = cv2.applyColorMap((depth_map * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
     cv2.imwrite(str(p.parent / f"{p.stem}_depth.png"), depth_color)
     logging.info("Saved depth map.")
 
-    # FIX #9 / #12: apply depth prefilter — removes back-leg pixels so leg
+    # FIX #9 / #12: apply depth prefilter - removes back-leg pixels so leg
     # selection only sees the frontmost leg.  percentile=25 is conservative
     # enough to keep the full cannon bone even in ground-level shots while
     # still stripping the clearly-far back leg (blue in TURBO).
@@ -774,6 +1087,22 @@ def process_image(path: str, do_debug: bool = False, inferencer=None) -> None:
     if do_debug:
         cv2.imwrite(str(p.parent / f"{p.stem}_depth_mask.png"), depth_mask)
         logging.info("Saved depth-filtered mask (debug).")
+
+    # Apply a stricter pixel-level depth gate to remove background legs.
+    depth_mask = depth_pixel_gate(depth_mask, depth_map,
+                                  depth_delta_start=0.35,
+                                  min_keep_frac=0.08,
+                                  min_height_frac=0.6,
+                                  debug=do_debug)
+    if do_debug:
+        cv2.imwrite(str(p.parent / f"{p.stem}_depth_mask_refined.png"), depth_mask)
+        logging.info("Saved refined depth-filtered mask (debug).")
+
+    # Ensure a single connected component remains (closest one)
+    depth_mask = keep_closest_component(depth_mask, depth_map, min_area_frac=0.005, debug=do_debug)
+    if do_debug:
+        cv2.imwrite(str(p.parent / f"{p.stem}_depth_mask_final.png"), depth_mask)
+        logging.info("Saved final depth-filtered mask (debug).")
 
     leg_masks = []
     leg_infos = []
@@ -811,7 +1140,7 @@ def process_image(path: str, do_debug: bool = False, inferencer=None) -> None:
 
     # --- Fallback path ---
     if not leg_masks:
-        logging.warning("AI keypoints missing or failed — using fallback leg selection.")
+        logging.warning("AI keypoints missing or failed - using fallback leg selection.")
         # FIX #9: use depth_mask so back-leg pixels are excluded from selection
         lm = select_front_leg_fallback(depth_mask, depth_map=depth_map, debug=do_debug)
         if lm is None:
@@ -871,6 +1200,7 @@ def main():
     parser = argparse.ArgumentParser(description="Horse leg symmetry analyzer (fixed v2)")
     parser.add_argument("images", nargs="+", help="Image files or glob patterns")
     parser.add_argument("--debug", action="store_true", help="Save intermediate debug images")
+    parser.add_argument("-preprocess", "--preprocess", action="store_true", help="Apply advanced preprocessing for black legs")
     parser.add_argument("--use-ai", action="store_true",
                         help="Enable MMPose AI keypoint detection if available")
     parser.add_argument("--model-path", type=str, default=None,
@@ -884,19 +1214,22 @@ def main():
         logging.error("No input images found.")
         sys.exit(1)
 
+    # Select runtime devices (auto-detect if args.device not provided)
+    mmpose_device = select_runtime_device(args.device)
+
     inferencer = None
     if args.use_ai and MMPoseInferencer is not None:
         try:
-            kwargs = {"device": args.device} if args.device else {}
+            kwargs = {"device": mmpose_device} if mmpose_device else {}
             pose = args.model_path or 'rtmpose-m_8xb64-210e_ap10k-256x256'
             inferencer = MMPoseInferencer(pose2d=pose, **kwargs)
-            logging.info("MMPose inferencer initialized.")
+            logging.info("MMPose inferencer initialized (device=%s).", mmpose_device)
         except Exception as e:
             logging.warning("Failed to initialize MMPoseInferencer: %s", e)
 
     for img_path in inputs:
         try:
-            process_image(img_path, do_debug=args.debug, inferencer=inferencer)
+            process_image(img_path, do_debug=args.debug, do_preprocess=args.preprocess, inferencer=inferencer)
         except Exception as e:
             logging.exception("Failed processing %s: %s", img_path, e)
 

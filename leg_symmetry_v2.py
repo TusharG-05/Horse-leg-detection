@@ -16,6 +16,14 @@ try:
 except Exception:
     _HAS_TORCH = False
 
+try:
+    from segment_anything import sam_model_registry, SamPredictor as _SamPredictor
+    _HAS_SAM = True
+except ImportError:
+    _HAS_SAM = False
+
+_sam_predictor = None  # lazy-loaded SAM predictor
+
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
@@ -1015,10 +1023,147 @@ def apply_overlay(img: np.ndarray, green_mask: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
+# SAM fallback helper
+# ---------------------------------------------------------------------------
+
+def _get_sam_predictor(checkpoint_path: str):
+    """Lazy-load and cache the SAM ViT-B predictor."""
+    global _sam_predictor
+    if _sam_predictor is None:
+        if not _HAS_SAM:
+            logging.warning("segment_anything not installed - SAM fallback disabled.")
+            return None
+        try:
+            sam = sam_model_registry["vit_b"](checkpoint=checkpoint_path)
+            sam.to(device="cpu")
+            _sam_predictor = _SamPredictor(sam)
+            logging.info("SAM ViT-B loaded from %s", checkpoint_path)
+        except Exception as e:
+            logging.warning("Failed to load SAM: %s", e)
+            return None
+    return _sam_predictor
+
+
+def isolate_leg_with_sam(image_bgr: np.ndarray,
+                         depth_map: np.ndarray,
+                         fg_mask: np.ndarray,
+                         checkpoint_path: str,
+                         debug: bool = False) -> np.ndarray | None:
+    """Use SAM with a multi-point cannon-bone axis prompt to isolate the front leg.
+
+    Builds 3 foreground prompt points along the full leg height (near-knee,
+    mid-cannon, hoof) by sampling the median X of the closer (higher-depth)
+    side of the foreground mask at 25%, 50% and 75% of the mask height.
+    This forces SAM to include the entire cannon bone, pastern and hoof in one
+    mask rather than segmenting just the hoof capsule.
+
+    Mask selection prefers the *largest* valid mask (most complete coverage)
+    over the highest-scoring one.
+
+    Returns a uint8 binary mask (0/255) or None on failure.
+    """
+    predictor = _get_sam_predictor(checkpoint_path)
+    if predictor is None:
+        return None
+
+    h, w = image_bgr.shape[:2]
+
+    # --- Build 3 prompt points along the closer side of the mask ---
+    # Step 1: find which horizontal half of the mask is closer on average.
+    ys_fg, xs_fg = np.where(fg_mask > 0)
+    if ys_fg.size == 0:
+        return None
+    top_y, bot_y = int(ys_fg.min()), int(ys_fg.max())
+    leg_h = max(1, bot_y - top_y)
+    mid_x_global = int(np.median(xs_fg))
+
+    left_px  = fg_mask[:, :mid_x_global] > 0
+    right_px = fg_mask[:, mid_x_global:] > 0
+    l_depth  = float(depth_map[:, :mid_x_global][left_px].mean()) if left_px.any() else 0.0
+    r_depth  = float(depth_map[:, mid_x_global:][right_px].mean()) if right_px.any() else 0.0
+    closer_left = l_depth >= r_depth  # True = front leg is on the left side
+
+    # Step 2: sample 3 Y positions and find the median X of the closer side
+    # at each row band.
+    prompt_points = []
+    for frac in (0.25, 0.50, 0.75):          # near-knee, mid-cannon, hoof
+        row_y = int(top_y + leg_h * frac)
+        # scan a small band around row_y
+        band_lo = max(0, row_y - 30)
+        band_hi = min(h, row_y + 30)
+        band_mask = fg_mask[band_lo:band_hi, :]
+        ys_b, xs_b = np.where(band_mask > 0)
+        if xs_b.size == 0:
+            continue
+        if closer_left:
+            half_xs = xs_b[xs_b <= mid_x_global]
+        else:
+            half_xs = xs_b[xs_b > mid_x_global]
+        if half_xs.size == 0:
+            half_xs = xs_b                   # fallback: use all xs
+        cx = int(np.median(half_xs))
+        prompt_points.append([cx, row_y])
+
+    if not prompt_points:
+        logging.warning("SAM: could not build axis prompt points.")
+        return None
+
+    if debug:
+        logging.info("SAM: axis prompt points = %s (closer_left=%s)",
+                     prompt_points, closer_left)
+
+    # --- Run SAM predictor with multi-point prompt ---
+    rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    try:
+        predictor.set_image(rgb)
+        masks, scores, _ = predictor.predict(
+            point_coords=np.array(prompt_points, dtype=np.float32),
+            point_labels=np.array([1] * len(prompt_points)),   # all foreground
+            multimask_output=True,
+        )
+    except Exception as e:
+        logging.warning("SAM inference failed: %s", e)
+        return None
+
+    if masks is None or len(masks) == 0:
+        logging.warning("SAM returned no masks.")
+        return None
+
+    # --- Select the best mask ---
+    # Prefer the *largest* valid mask that is still smaller than the full
+    # foreground blob (meaning SAM actually isolated something vs. just
+    # selecting the entire scene).
+    fg_area = max(1, int(cv2.countNonZero(fg_mask)))
+    best_mask, best_area = None, 0
+    for mask, score in zip(masks, scores):
+        m = (mask.astype(np.uint8) * 255)
+        m = cv2.bitwise_and(m, fg_mask)          # clip to foreground
+        area = cv2.countNonZero(m)
+        if area < 500:
+            continue
+        if area > fg_area * 0.90:                # too big - not isolated
+            continue
+        if area > best_area:
+            best_area = area
+            best_mask = m
+
+    if best_mask is None:
+        logging.warning("SAM: no suitable mask found (all too large or too small).")
+        return None
+
+    logging.info("SAM fallback succeeded (area=%d / fg=%d = %.1f%%)",
+                 best_area, fg_area, 100.0 * best_area / fg_area)
+    return best_mask
+
+
+
+
+# ---------------------------------------------------------------------------
 # Main processing pipeline
 # ---------------------------------------------------------------------------
 
-def process_image(path: str, do_debug: bool = False, do_preprocess: bool = False, inferencer=None) -> None:
+def process_image(path: str, do_debug: bool = False, do_preprocess: bool = False,
+                  inferencer=None, sam_checkpoint: str | None = None) -> None:
     p = Path(path)
     img = cv2.imread(str(p))
     if img is None:
@@ -1050,11 +1195,11 @@ def process_image(path: str, do_debug: bool = False, do_preprocess: bool = False
         # Global adjustments are safer than CLAHE for depth models.
         try:
             # 1. Global contrast (alpha) and brightness (beta) boost
-            adjusted = cv2.convertScaleAbs(blue_preview, alpha=1.35, beta=25)
+            adjusted = cv2.convertScaleAbs(blue_preview, alpha=1.4, beta=25)
 
             # 2. Saturation boost
             hsv = cv2.cvtColor(adjusted, cv2.COLOR_BGR2HSV).astype(np.float32)
-            hsv[:, :, 1] = np.clip(hsv[:, :, 1] * 1.35, 0, 255)
+            hsv[:, :, 1] = np.clip(hsv[:, :, 1] * 1.40, 0, 255)
             blue_for_depth = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
         except Exception as e:
             logging.warning("Preprocessing failed: %s", e)
@@ -1064,7 +1209,7 @@ def process_image(path: str, do_debug: bool = False, do_preprocess: bool = False
         # depth model isn't confused by very dark legs or monotone backgrounds.
         try:
             hsv = cv2.cvtColor(blue_preview, cv2.COLOR_BGR2HSV).astype(np.float32)
-            hsv[:, :, 1] = np.clip(hsv[:, :, 1] * 1.15, 0, 255)
+            hsv[:, :, 1] = np.clip(hsv[:, :, 1] * 1.30, 0, 255)
             blue_for_depth = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
         except Exception:
             blue_for_depth = blue_preview.copy()
@@ -1148,6 +1293,20 @@ def process_image(path: str, do_debug: bool = False, do_preprocess: bool = False
             cv2.imwrite(str(p.parent / f"{p.stem}_analyzed.jpg"), img)
             return
         lm = trim_upper_leg_fraction(lm, 0.20)
+
+        # --- SAM fallback (last resort) ---
+        # If the isolated mask is suspiciously large (> 25% of image area)
+        # the fallback likely captured a fused two-leg blob.  Attempt to
+        # re-isolate the front leg using SAM with a depth-guided point prompt.
+        if sam_checkpoint and cv2.countNonZero(lm) > h * w * 0.15:
+            logging.info("Mask covers %.1f%% of image - attempting SAM fallback.",
+                         100.0 * cv2.countNonZero(lm) / (h * w))
+            sam_lm = isolate_leg_with_sam(
+                img, depth_map, lm, sam_checkpoint, debug=do_debug)
+            if sam_lm is not None:
+                lm = sam_lm
+                logging.info("SAM mask accepted - replacing fallback mask.")
+
         leg_masks = [lm]
         leg_infos = [{'mask': lm, 'knee': (w / 2.0, 0.0), 'hoof': (w / 2.0, float(h - 1))}]
         cv2.imwrite(str(p.parent / f"{p.stem}_isolated_leg.png"), lm)
@@ -1207,6 +1366,10 @@ def main():
                         help="Optional local model path for MMPoseInferencer")
     parser.add_argument("--device", type=str, default=None,
                         help="Device for MMPose (e.g. cpu or cuda:0)")
+    parser.add_argument("--use-sam", action="store_true",
+                        help="Enable SAM as a last-resort fallback for fused two-leg images")
+    parser.add_argument("--sam-checkpoint", type=str, default="sam_vit_b.pth",
+                        help="Path to SAM ViT-B checkpoint (default: sam_vit_b.pth)")
     args = parser.parse_args()
 
     inputs = sorted(set(f for pat in args.images for f in glob.glob(pat)))
@@ -1227,9 +1390,19 @@ def main():
         except Exception as e:
             logging.warning("Failed to initialize MMPoseInferencer: %s", e)
 
+    sam_checkpoint = None
+    if args.use_sam:
+        if not _HAS_SAM:
+            logging.warning("--use-sam requested but segment_anything is not installed. "
+                            "Install with: pip install segment-anything")
+        else:
+            sam_checkpoint = args.sam_checkpoint
+            logging.info("SAM fallback enabled (checkpoint=%s).", sam_checkpoint)
+
     for img_path in inputs:
         try:
-            process_image(img_path, do_debug=args.debug, do_preprocess=args.preprocess, inferencer=inferencer)
+            process_image(img_path, do_debug=args.debug, do_preprocess=args.preprocess,
+                          inferencer=inferencer, sam_checkpoint=sam_checkpoint)
         except Exception as e:
             logging.exception("Failed processing %s: %s", img_path, e)
 
